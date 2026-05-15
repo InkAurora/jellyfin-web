@@ -77,6 +77,10 @@ function tryRemoveElement(elem) {
     }
 }
 
+function isManualTextTrack(track) {
+    return (track.label || '').includes('manualTrack');
+}
+
 function enableNativeTrackSupport(mediaSource, track) {
     if (track?.DeliveryMethod === 'Embed') {
         return true;
@@ -1142,19 +1146,25 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    destroyNativeTracks(videoElement, targetTrackIndex) {
+    destroyNativeTracks(videoElement, targetTrackIndex, disableEmbeddedTracks = false) {
         if (videoElement) {
             const destroySingleTrack = typeof targetTrackIndex === 'number';
-            const allTracks = videoElement.textTracks || []; // get list of tracks
-            for (let index = 0; index < allTracks.length; index++) {
-                const track = allTracks[index];
-                // Skip all other tracks if we are targeting just one
-                if (destroySingleTrack && targetTrackIndex !== index) {
+            let manualTrackIndex = 0;
+            const allTracks = Array.from(videoElement.textTracks || []); // get list of tracks
+            for (const track of allTracks) {
+                if (!isManualTextTrack(track)) {
+                    if (disableEmbeddedTracks) {
+                        track.mode = 'disabled';
+                    }
                     continue;
                 }
-                if (track.label.includes('manualTrack')) {
+
+                // Skip all other manual tracks if we are targeting just one
+                if (!destroySingleTrack || targetTrackIndex === manualTrackIndex) {
                     track.mode = 'disabled';
                 }
+
+                manualTrackIndex++;
             }
         }
     }
@@ -1180,9 +1190,9 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    destroyCustomTrack(videoElement, targetTrackIndex) {
+    destroyCustomTrack(videoElement, targetTrackIndex, disableEmbeddedTracks = false) {
         this.destroyCustomRenderedTrackElements(targetTrackIndex);
-        this.destroyNativeTracks(videoElement, targetTrackIndex);
+        this.destroyNativeTracks(videoElement, targetTrackIndex, disableEmbeddedTracks);
         this.destroyStoredTrackInfo(targetTrackIndex);
 
         const octopus = this.#currentAssRenderer;
@@ -1237,7 +1247,8 @@ export class HtmlVideoPlayer {
     setTrackForDisplay(videoElement, track, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
         if (!track) {
             // Destroy all tracks by passing undefined if there is no valid primary track
-            this.destroyCustomTrack(videoElement, this.isSecondaryTrack(targetTextTrackIndex) ? targetTextTrackIndex : undefined);
+            const targetTrackIndex = this.isSecondaryTrack(targetTextTrackIndex) ? targetTextTrackIndex : undefined;
+            this.destroyCustomTrack(videoElement, targetTrackIndex, !this.isSecondaryTrack(targetTextTrackIndex));
             return;
         }
 
@@ -1254,7 +1265,7 @@ export class HtmlVideoPlayer {
         this.resetSubtitleOffset();
         const item = this._currentPlayOptions.item;
 
-        this.destroyCustomTrack(videoElement, targetTextTrackIndex);
+        this.destroyCustomTrack(videoElement, targetTextTrackIndex, true);
 
         if (this.isSecondaryTrack(targetTextTrackIndex)) {
             this.#customSecondaryTrackIndex = track.Index;
@@ -1459,9 +1470,9 @@ export class HtmlVideoPlayer {
         }
 
         let trackElement = null;
-        const updatingTrack = videoElement.textTracks && videoElement.textTracks.length > (this.isSecondaryTrack(targetTextTrackIndex) ? 1 : 0);
-        if (updatingTrack) {
-            trackElement = videoElement.textTracks[targetTextTrackIndex];
+        const manualTracks = Array.from(videoElement.textTracks || []).filter(isManualTextTrack);
+        if (manualTracks.length > targetTextTrackIndex) {
+            trackElement = manualTracks[targetTextTrackIndex];
             // This throws an error in IE, but is fine in chrome
             // In IE it's not necessary anyway because changing the src seems to be enough
             try {
