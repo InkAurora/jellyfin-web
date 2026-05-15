@@ -125,25 +125,18 @@ class HtmlAudioPlayer {
                         ?? options.item.NormalizationGain;
                 } else {
                     console.debug('normalization disabled');
+                    self.normalizationGain = 1;
+                    self.updateGainNode();
                     return;
                 }
 
                 if (!self.gainNode) {
-                    addGainElement(elem);
+                    self.addGainElement(elem);
                     if (!self.gainNode) return;
                 }
 
-                if (normalizationGain) {
-                    self.normalizationGain = Math.pow(10, normalizationGain / 20);
-                    self.gainNode.gain.value = self.normalizationGain;
-                } else {
-                    self.gainNode.gain.value = 1;
-                    self.normalizationGain = 1;
-                }
-                if (browser.safari) {
-                    // Gain value is absolute in Safari. Add volume from the slider
-                    self.gainNode.gain.value *= elem.volume;
-                }
+                self.normalizationGain = normalizationGain ? Math.pow(10, normalizationGain / 20) : 1;
+                self.updateGainNode();
                 console.debug('gain: ' + self.normalizationGain);
             }).catch((err) => {
                 console.error('Failed to add/change gainNode', err);
@@ -260,6 +253,7 @@ class HtmlAudioPlayer {
         self.destroy = function () {
             unBindEvents(self._mediaElement);
             htmlMediaHelper.resetSrc(self._mediaElement);
+            self.destroyGainElement();
         };
 
         function createMediaElement() {
@@ -279,32 +273,14 @@ class HtmlAudioPlayer {
                 document.body.appendChild(elem);
             }
 
-            // TODO: Move volume control to PlaybackManager. Player should just be a wrapper that translates commands into API calls.
-            if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
-                elem.volume = htmlMediaHelper.getSavedVolume();
-            }
-
             self._mediaElement = elem;
 
-            return elem;
-        }
-
-        function addGainElement(elem) {
-            try {
-                const AudioContext = window.AudioContext || window.webkitAudioContext; /* eslint-disable-line compat/compat */
-
-                const audioCtx = new AudioContext();
-                const source = audioCtx.createMediaElementSource(elem);
-
-                const gainNode = audioCtx.createGain();
-
-                source.connect(gainNode);
-                gainNode.connect(audioCtx.destination);
-
-                self.gainNode = gainNode;
-            } catch (e) {
-                console.error('Web Audio API is not supported in this browser', e);
+            // TODO: Move volume control to PlaybackManager. Player should just be a wrapper that translates commands into API calls.
+            if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+                self.setVolume(htmlMediaHelper.getSavedVolumeLevel(), false);
             }
+
+            return elem;
         }
 
         function onEnded() {
@@ -324,10 +300,10 @@ class HtmlAudioPlayer {
 
         function onVolumeChange() {
             if (!self._isFadingOut) {
+                self._volumeLevel ??= htmlMediaHelper.getVolumeLevelFromElementVolume(this.volume);
                 htmlMediaHelper.saveVolume(this.volume);
-                if (browser.safari && self.gainNode) {
-                    self.gainNode.gain.value = this.volume * self.normalizationGain;
-                }
+                htmlMediaHelper.saveVolumeLevel(self._volumeLevel);
+                self.updateGainNode();
                 Events.trigger(self, 'volumechange');
             }
         }
@@ -517,22 +493,87 @@ class HtmlAudioPlayer {
         return null;
     }
 
-    setVolume(val) {
+    addGainElement(elem) {
+        if (this.gainNode) return this.gainNode;
+
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext; /* eslint-disable-line compat/compat */
+
+            const audioCtx = new AudioContext();
+            const source = audioCtx.createMediaElementSource(elem);
+            const gainNode = audioCtx.createGain();
+
+            source.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+
+            this.audioContext = audioCtx;
+            this.mediaElementSource = source;
+            this.gainNode = gainNode;
+            return gainNode;
+        } catch (e) {
+            console.error('Web Audio API is not supported in this browser', e);
+            return null;
+        }
+    }
+
+    destroyGainElement() {
+        try {
+            this.gainNode?.disconnect();
+            this.mediaElementSource?.disconnect();
+            this.audioContext?.close();
+        } catch (err) {
+            console.error('error destroying volume boost', err);
+        }
+
+        this.gainNode = null;
+        this.mediaElementSource = null;
+        this.audioContext = null;
+    }
+
+    updateGainNode() {
+        if (!this.gainNode) return;
+
+        let gain = htmlMediaHelper.getVolumeBoostGain(this._volumeLevel);
+        gain *= this.normalizationGain || 1;
+
+        if (browser.safari) {
+            // Gain value is absolute in Safari. Add volume from the slider.
+            gain *= this._mediaElement?.volume || 0;
+        }
+
+        this.gainNode.gain.value = gain;
+    }
+
+    setVolume(val, triggerEvents = true) {
         const mediaElement = this._mediaElement;
-        if (mediaElement) {
-            mediaElement.volume = Math.pow(val / 100, 3);
+        if (!mediaElement) {
+            return;
+        }
+
+        let volumeLevel = htmlMediaHelper.clampVolumeLevel(val);
+        if (volumeLevel > 100 && !this.gainNode && !this.addGainElement(mediaElement)) {
+            volumeLevel = 100;
+        }
+
+        this._volumeLevel = volumeLevel;
+        mediaElement.volume = htmlMediaHelper.getMediaElementVolume(volumeLevel);
+        this.updateGainNode();
+        htmlMediaHelper.saveVolume(mediaElement.volume);
+        htmlMediaHelper.saveVolumeLevel(volumeLevel);
+        if (triggerEvents) {
+            Events.trigger(this, 'volumechange');
         }
     }
 
     getVolume() {
         const mediaElement = this._mediaElement;
         if (mediaElement) {
-            return Math.min(Math.round(Math.pow(mediaElement.volume, 1 / 3) * 100), 100);
+            return this._volumeLevel ?? htmlMediaHelper.getVolumeLevelFromElementVolume(mediaElement.volume);
         }
     }
 
     volumeUp() {
-        this.setVolume(Math.min(this.getVolume() + 2, 100));
+        this.setVolume(Math.min(this.getVolume() + 2, 150));
     }
 
     volumeDown() {
@@ -602,6 +643,10 @@ function getSupportedFeatures() {
 
     if (browser.safari) {
         list.push('AirPlay');
+    }
+
+    if (htmlMediaHelper.supportsVolumeBoost()) {
+        list.push('VolumeBoost');
     }
 
     return list;

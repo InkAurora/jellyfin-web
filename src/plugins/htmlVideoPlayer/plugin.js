@@ -31,9 +31,15 @@ import {
     seekOnPlaybackStart,
     onErrorInternal,
     handleHlsJsMediaError,
-    getSavedVolume,
+    getSavedVolumeLevel,
+    saveVolumeLevel,
     isValidDuration,
-    getBufferedRanges
+    getBufferedRanges,
+    getMediaElementVolume,
+    getVolumeBoostGain,
+    getVolumeLevelFromElementVolume,
+    clampVolumeLevel,
+    supportsVolumeBoost
 } from '../../components/htmlMediaHelper';
 import itemHelper from '../../components/itemHelper';
 import globalize from '../../lib/globalize';
@@ -277,6 +283,22 @@ export class HtmlVideoPlayer {
      * @type {HTMLVideoElement | null | undefined}
      */
     #mediaElement;
+    /**
+     * @type {AudioContext | null | undefined}
+     */
+    #audioContext;
+    /**
+     * @type {MediaElementAudioSourceNode | null | undefined}
+     */
+    #mediaElementSource;
+    /**
+     * @type {GainNode | null | undefined}
+     */
+    #gainNode;
+    /**
+     * @type {number | undefined}
+     */
+    #volumeLevel;
     /**
      * @type {number}
      */
@@ -856,6 +878,7 @@ export class HtmlVideoPlayer {
 
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
+        this.#destroyVolumeBoost();
 
         setBackdropTransparency(TRANSPARENCY_LEVEL.None);
         document.body.classList.remove('hide-scroll');
@@ -948,7 +971,9 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
+        this.#volumeLevel ??= getVolumeLevelFromElementVolume(elem.volume);
         saveVolume(elem.volume);
+        saveVolumeLevel(this.#volumeLevel);
         Events.trigger(this, 'volumechange');
     };
 
@@ -1652,10 +1677,12 @@ export class HtmlVideoPlayer {
 
                 playerDlg.innerHTML = html;
                 const videoElement = playerDlg.querySelector('video');
+                this.#videoDialog = playerDlg;
+                this.#mediaElement = videoElement;
 
                 // TODO: Move volume control to PlaybackManager. Player should just be a wrapper that translates commands into API calls.
                 if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
-                    videoElement.volume = getSavedVolume();
+                    this.setVolume(getSavedVolumeLevel(), false);
                 }
 
                 videoElement.addEventListener('timeupdate', this.onTimeUpdate);
@@ -1672,8 +1699,6 @@ export class HtmlVideoPlayer {
                 }
 
                 document.body.insertBefore(playerDlg, document.body.firstChild);
-                this.#videoDialog = playerDlg;
-                this.#mediaElement = videoElement;
 
                 delete this.forcedFullscreen;
 
@@ -1792,6 +1817,9 @@ export class HtmlVideoPlayer {
         list.push('SetBrightness');
         list.push('SetAspectRatio');
         list.push('SecondarySubtitles');
+        if (supportsVolumeBoost()) {
+            list.push('VolumeBoost');
+        }
 
         return list;
     }
@@ -2041,22 +2069,95 @@ export class HtmlVideoPlayer {
         }];
     }
 
-    setVolume(val) {
+    #ensureVolumeBoost() {
+        if (this.#gainNode) {
+            return this.#gainNode;
+        }
+
         const mediaElement = this.#mediaElement;
-        if (mediaElement) {
-            mediaElement.volume = Math.pow(val / 100, 3);
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!mediaElement || !AudioContext) {
+            return null;
+        }
+
+        try {
+            const audioContext = new AudioContext();
+            const source = audioContext.createMediaElementSource(mediaElement);
+            const gainNode = audioContext.createGain();
+
+            source.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            this.#audioContext = audioContext;
+            this.#mediaElementSource = source;
+            this.#gainNode = gainNode;
+
+            return gainNode;
+        } catch (err) {
+            console.error('Web Audio API is not supported in this browser', err);
+            return null;
+        }
+    }
+
+    #destroyVolumeBoost() {
+        try {
+            this.#gainNode?.disconnect();
+            this.#mediaElementSource?.disconnect();
+            this.#audioContext?.close();
+        } catch (err) {
+            console.error('error destroying volume boost', err);
+        }
+
+        this.#gainNode = null;
+        this.#mediaElementSource = null;
+        this.#audioContext = null;
+    }
+
+    #applyVolumeBoost(volumeLevel) {
+        if (volumeLevel > 100) {
+            const gainNode = this.#ensureVolumeBoost();
+            if (!gainNode) {
+                return false;
+            }
+            gainNode.gain.value = getVolumeBoostGain(volumeLevel);
+        } else if (this.#gainNode) {
+            this.#gainNode.gain.value = 1;
+        }
+
+        return true;
+    }
+
+    setVolume(val, triggerEvents = true) {
+        const mediaElement = this.#mediaElement;
+        if (!mediaElement) {
+            return;
+        }
+
+        let volumeLevel = clampVolumeLevel(val);
+        const canApplyVolume = this.#applyVolumeBoost(volumeLevel);
+        if (volumeLevel > 100 && !canApplyVolume) {
+            volumeLevel = 100;
+            this.#applyVolumeBoost(volumeLevel);
+        }
+
+        this.#volumeLevel = volumeLevel;
+        mediaElement.volume = getMediaElementVolume(volumeLevel);
+        saveVolume(mediaElement.volume);
+        saveVolumeLevel(volumeLevel);
+        if (triggerEvents) {
+            Events.trigger(this, 'volumechange');
         }
     }
 
     getVolume() {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {
-            return Math.min(Math.round(Math.pow(mediaElement.volume, 1 / 3) * 100), 100);
+            return this.#volumeLevel ?? getVolumeLevelFromElementVolume(mediaElement.volume);
         }
     }
 
     volumeUp() {
-        this.setVolume(Math.min(this.getVolume() + 2, 100));
+        this.setVolume(Math.min(this.getVolume() + 2, 150));
     }
 
     volumeDown() {

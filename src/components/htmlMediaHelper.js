@@ -3,13 +3,62 @@ import browser from '../scripts/browser';
 import Events from '../utils/events.ts';
 import { MediaError } from 'types/mediaError';
 
+export const MAX_VOLUME_LEVEL = 150;
+
+export function clampVolumeLevel(value) {
+    const volumeLevel = Number(value);
+    if (!Number.isFinite(volumeLevel)) {
+        return 100;
+    }
+
+    return Math.min(Math.max(volumeLevel, 0), MAX_VOLUME_LEVEL);
+}
+
+export function getVolumeLevelFromElementVolume(value) {
+    const elementVolume = Math.min(Math.max(Number(value) || 0, 0), 1);
+
+    return Math.min(Math.round(Math.pow(elementVolume, 1 / 3) * 100), 100);
+}
+
+export function getMediaElementVolume(volumeLevel) {
+    return Math.pow(Math.min(clampVolumeLevel(volumeLevel), 100) / 100, 3);
+}
+
+export function getVolumeBoostGain(volumeLevel) {
+    return Math.max(clampVolumeLevel(volumeLevel) / 100, 1);
+}
+
+export function supportsVolumeBoost() {
+    return !!(window.AudioContext || window.webkitAudioContext); /* eslint-disable-line compat/compat */
+}
+
 export function getSavedVolume() {
-    return appSettings.get('volume') || 1;
+    const savedVolume = Number(appSettings.get('volume'));
+    if (Number.isFinite(savedVolume)) {
+        return Math.min(Math.max(savedVolume, 0), 1);
+    }
+
+    return 1;
 }
 
 export function saveVolume(value) {
-    if (value) {
-        appSettings.set('volume', value);
+    if (value != null) {
+        appSettings.set('volume', Math.min(Math.max(Number(value) || 0, 0), 1));
+    }
+}
+
+export function getSavedVolumeLevel() {
+    const savedVolumeLevel = Number(appSettings.get('volumelevel'));
+    if (Number.isFinite(savedVolumeLevel)) {
+        return clampVolumeLevel(savedVolumeLevel);
+    }
+
+    return getVolumeLevelFromElementVolume(getSavedVolume());
+}
+
+export function saveVolumeLevel(value) {
+    if (value != null) {
+        appSettings.set('volumelevel', clampVolumeLevel(value));
     }
 }
 
