@@ -630,12 +630,12 @@ export default function (view) {
         }
     }
 
-    function onTimeUpdate() {
+    function onTimeUpdate(_, options) {
         // Test for 'currentItem' is required for Firefox since its player spams 'timeupdate' events even being at breakpoint
         if (isEnabled && currentItem) {
             const now = new Date().getTime();
 
-            if (now - lastUpdateTime >= 700) {
+            if (options?.isPositionChange || now - lastUpdateTime >= 700) {
                 lastUpdateTime = now;
                 const player = this;
                 currentRuntimeTicks = playbackManager.duration(player);

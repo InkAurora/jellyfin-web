@@ -663,14 +663,14 @@ function onStateChanged(event, state) {
     updatePlayerStateInternal(event, state, player);
 }
 
-function onTimeUpdate() {
+function onTimeUpdate(_, options) {
     if (!isEnabled) {
         return;
     }
 
     // Try to avoid hammering the document with changes
     const now = new Date().getTime();
-    if ((now - lastUpdateTime) < 700) {
+    if (!options?.isPositionChange && (now - lastUpdateTime) < 700) {
         return;
     }
     lastUpdateTime = now;

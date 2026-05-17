@@ -418,12 +418,15 @@ class HtmlAudioPlayer {
         const mediaElement = this._mediaElement;
         if (mediaElement) {
             if (val != null) {
-                mediaElement.currentTime = val / 1000;
+                const time = val / 1000;
+                mediaElement.currentTime = time;
+                this._currentTime = time;
+                Events.trigger(this, 'timeupdate', [{ isPositionChange: true }]);
                 return;
             }
 
             const currentTime = this._currentTime;
-            if (currentTime) {
+            if (currentTime != null) {
                 return currentTime * 1000;
             }
 

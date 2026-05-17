@@ -578,10 +578,10 @@ export default function () {
         onPlaylistUpdate();
     }
 
-    function onTimeUpdate() {
+    function onTimeUpdate(_, options) {
         const now = new Date().getTime();
 
-        if (now - lastUpdateTime >= 700) {
+        if (options?.isPositionChange || now - lastUpdateTime >= 700) {
             lastUpdateTime = now;
             const player = this;
             currentRuntimeTicks = playbackManager.duration(player);
