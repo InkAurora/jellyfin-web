@@ -105,8 +105,7 @@ function updatePlayerVolumeState(isMuted, volume) {
         iconElement.classList.add(isMuted ? 'volume_off' : 'volume_up');
     }
     if (progressElement) {
-        const maxVolume = currentPlayer?.getMaxVolumeLevel?.() || 100;
-        progressElement.style.width = Math.min((volume || 0) / maxVolume * 100, 100) + '%';
+        progressElement.style.width = (volume || 0) + '%';
     }
 }
 

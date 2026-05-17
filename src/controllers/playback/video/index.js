@@ -868,7 +868,6 @@ export default function (view) {
         const supportedCommands = currentPlayerSupportedCommands;
         let showMuteButton = true;
         let showVolumeSlider = true;
-        const maxVolume = player?.getMaxVolumeLevel?.() || 100;
 
         if (supportedCommands.indexOf('Mute') === -1) {
             showMuteButton = false;
@@ -908,9 +907,6 @@ export default function (view) {
             } else {
                 nowPlayingVolumeSliderContainer.classList.add('hide');
             }
-
-            nowPlayingVolumeSlider.max = maxVolume;
-            nowPlayingVolumeSlider.setAttribute('max', maxVolume);
 
             if (!nowPlayingVolumeSlider.dragging) {
                 nowPlayingVolumeSlider.value = volumeLevel || 0;

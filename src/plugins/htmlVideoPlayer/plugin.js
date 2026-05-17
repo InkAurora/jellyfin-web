@@ -31,15 +31,9 @@ import {
     seekOnPlaybackStart,
     onErrorInternal,
     handleHlsJsMediaError,
-    getSavedVolumeLevel,
-    saveVolumeLevel,
+    getSavedVolume,
     isValidDuration,
-    getBufferedRanges,
-    getMediaElementVolume,
-    getVolumeBoostGain,
-    getVolumeLevelFromElementVolume,
-    clampVolumeLevel,
-    supportsVolumeBoost
+    getBufferedRanges
 } from '../../components/htmlMediaHelper';
 import itemHelper from '../../components/itemHelper';
 import globalize from '../../lib/globalize';
@@ -232,10 +226,6 @@ export class HtmlVideoPlayer {
      */
     #audioTrackIndexToSetOnPlaying;
     /**
-     * @type {number | null | undefined}
-     */
-    #audioStreamIndex;
-    /**
      * @type {any | null | undefined}
      */
     #currentAssRenderer;
@@ -287,22 +277,6 @@ export class HtmlVideoPlayer {
      * @type {HTMLVideoElement | null | undefined}
      */
     #mediaElement;
-    /**
-     * @type {AudioContext | null | undefined}
-     */
-    #audioContext;
-    /**
-     * @type {MediaElementAudioSourceNode | null | undefined}
-     */
-    #mediaElementSource;
-    /**
-     * @type {GainNode | null | undefined}
-     */
-    #gainNode;
-    /**
-     * @type {number | undefined}
-     */
-    #volumeLevel;
     /**
      * @type {number}
      */
@@ -541,7 +515,6 @@ export class HtmlVideoPlayer {
             secondaryTrackValid = false;
         }
 
-        this.#audioStreamIndex = options.mediaSource.DefaultAudioStreamIndex;
         this.#audioTrackIndexToSetOnPlaying = options.playMethod === 'Transcode' ? null : options.mediaSource.DefaultAudioStreamIndex;
 
         this._currentPlayOptions = options;
@@ -812,7 +785,6 @@ export class HtmlVideoPlayer {
     }
 
     setAudioStreamIndex(index) {
-        this.#audioStreamIndex = index;
         const streams = this.getSupportedAudioStreams();
 
         if (streams.length < 2) {
@@ -884,7 +856,6 @@ export class HtmlVideoPlayer {
 
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
-        this.#destroyVolumeBoost();
 
         setBackdropTransparency(TRANSPARENCY_LEVEL.None);
         document.body.classList.remove('hide-scroll');
@@ -977,9 +948,7 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
-        this.#volumeLevel ??= getVolumeLevelFromElementVolume(elem.volume);
         saveVolume(elem.volume);
-        saveVolumeLevel(this.#volumeLevel);
         Events.trigger(this, 'volumechange');
     };
 
@@ -1026,11 +995,6 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
-        if (this.getMaxVolumeLevel() > 100) {
-            this.#ensureVolumeBoost();
-            this.#applyVolumeBoost(this.#volumeLevel ?? getVolumeLevelFromElementVolume(elem.volume));
-        }
-
         if (!this.#started) {
             this.#started = true;
             elem.removeAttribute('controls');
@@ -1688,12 +1652,10 @@ export class HtmlVideoPlayer {
 
                 playerDlg.innerHTML = html;
                 const videoElement = playerDlg.querySelector('video');
-                this.#videoDialog = playerDlg;
-                this.#mediaElement = videoElement;
 
                 // TODO: Move volume control to PlaybackManager. Player should just be a wrapper that translates commands into API calls.
                 if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
-                    this.setVolume(getSavedVolumeLevel(), false);
+                    videoElement.volume = getSavedVolume();
                 }
 
                 videoElement.addEventListener('timeupdate', this.onTimeUpdate);
@@ -1710,6 +1672,8 @@ export class HtmlVideoPlayer {
                 }
 
                 document.body.insertBefore(playerDlg, document.body.firstChild);
+                this.#videoDialog = playerDlg;
+                this.#mediaElement = videoElement;
 
                 delete this.forcedFullscreen;
 
@@ -1828,9 +1792,6 @@ export class HtmlVideoPlayer {
         list.push('SetBrightness');
         list.push('SetAspectRatio');
         list.push('SecondarySubtitles');
-        if (supportsVolumeBoost()) {
-            list.push('VolumeBoost');
-        }
 
         return list;
     }
@@ -2080,106 +2041,22 @@ export class HtmlVideoPlayer {
         }];
     }
 
-    #ensureVolumeBoost() {
-        if (this.#gainNode) {
-            return this.#gainNode;
-        }
-
+    setVolume(val) {
         const mediaElement = this.#mediaElement;
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        if (!mediaElement || !AudioContext) {
-            return null;
-        }
-
-        try {
-            const audioContext = new AudioContext();
-            const source = audioContext.createMediaElementSource(mediaElement);
-            const gainNode = audioContext.createGain();
-
-            source.connect(gainNode);
-            gainNode.connect(audioContext.destination);
-
-            this.#audioContext = audioContext;
-            this.#mediaElementSource = source;
-            this.#gainNode = gainNode;
-
-            audioContext.resume?.().catch((err) => {
-                console.error('error resuming volume boost audio context', err);
-            });
-
-            return gainNode;
-        } catch (err) {
-            console.error('Web Audio API is not supported in this browser', err);
-            return null;
-        }
-    }
-
-    #destroyVolumeBoost() {
-        try {
-            this.#gainNode?.disconnect();
-            this.#mediaElementSource?.disconnect();
-            this.#audioContext?.close();
-        } catch (err) {
-            console.error('error destroying volume boost', err);
-        }
-
-        this.#gainNode = null;
-        this.#mediaElementSource = null;
-        this.#audioContext = null;
-    }
-
-    #applyVolumeBoost(volumeLevel) {
-        if (this.getMaxVolumeLevel() <= 100) {
-            if (this.#gainNode) {
-                this.#gainNode.gain.value = 1;
-            }
-            return volumeLevel <= 100;
-        }
-
-        if (volumeLevel > 100) {
-            const gainNode = this.#ensureVolumeBoost();
-            if (!gainNode) {
-                return false;
-            }
-            gainNode.gain.value = getVolumeBoostGain(volumeLevel);
-        } else if (this.#gainNode) {
-            this.#gainNode.gain.value = 1;
-        }
-
-        return true;
-    }
-
-    setVolume(val, triggerEvents = true) {
-        const mediaElement = this.#mediaElement;
-        if (!mediaElement) {
-            return;
-        }
-
-        let volumeLevel = Math.min(clampVolumeLevel(val), this.getMaxVolumeLevel());
-        const canApplyVolume = this.#applyVolumeBoost(volumeLevel);
-        if (volumeLevel > 100 && !canApplyVolume) {
-            volumeLevel = 100;
-            this.#applyVolumeBoost(volumeLevel);
-        }
-
-        this.#volumeLevel = volumeLevel;
-        mediaElement.volume = getMediaElementVolume(volumeLevel);
-        saveVolume(mediaElement.volume);
-        saveVolumeLevel(volumeLevel);
-        if (triggerEvents) {
-            Events.trigger(this, 'volumechange');
+        if (mediaElement) {
+            mediaElement.volume = Math.pow(val / 100, 3);
         }
     }
 
     getVolume() {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {
-            return this.#volumeLevel ?? getVolumeLevelFromElementVolume(mediaElement.volume);
+            return Math.min(Math.round(Math.pow(mediaElement.volume, 1 / 3) * 100), 100);
         }
     }
 
     volumeUp() {
-        this.setVolume(Math.min(this.getVolume() + 2, this.getMaxVolumeLevel()));
+        this.setVolume(Math.min(this.getVolume() + 2, 100));
     }
 
     volumeDown() {
@@ -2199,27 +2076,6 @@ export class HtmlVideoPlayer {
             return mediaElement.muted;
         }
         return false;
-    }
-
-    getCurrentAudioStream() {
-        const mediaSource = this._currentPlayOptions?.mediaSource;
-        if (!mediaSource) {
-            return null;
-        }
-
-        const audioStreams = getMediaStreamAudioTracks(mediaSource);
-        const streamIndex = this.#audioStreamIndex ?? mediaSource.DefaultAudioStreamIndex;
-
-        return audioStreams.find(stream => stream.Index === streamIndex) || audioStreams[0] || null;
-    }
-
-    getMaxVolumeLevel() {
-        const audioStream = this.getCurrentAudioStream();
-        if (audioStream?.Channels > 2) {
-            return 100;
-        }
-
-        return 150;
     }
 
     #applyAspectRatio(val = this.getAspectRatio()) {
