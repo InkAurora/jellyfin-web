@@ -868,7 +868,7 @@ export default function (view) {
         const supportedCommands = currentPlayerSupportedCommands;
         let showMuteButton = true;
         let showVolumeSlider = true;
-        const maxVolume = player?.isLocalPlayer && !appHost.supports(AppFeature.PhysicalVolumeControl) ? 150 : 100;
+        const maxVolume = player?.getMaxVolumeLevel?.() || 100;
 
         if (supportedCommands.indexOf('Mute') === -1) {
             showMuteButton = false;

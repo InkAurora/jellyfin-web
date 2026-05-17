@@ -428,7 +428,7 @@ function updatePlayerVolumeState(isMuted, volumeLevel) {
 
     let showMuteButton = true;
     let showVolumeSlider = true;
-    const maxVolume = currentPlayer?.isLocalPlayer && !appHost.supports(AppFeature.PhysicalVolumeControl) ? 150 : 100;
+    const maxVolume = currentPlayer?.getMaxVolumeLevel?.() || 100;
 
     if (supportedCommands.indexOf('ToggleMute') === -1) {
         showMuteButton = false;

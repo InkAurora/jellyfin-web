@@ -309,7 +309,7 @@ class HtmlAudioPlayer {
         }
 
         function onPlaying(e) {
-            if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+            if (self.getMaxVolumeLevel() > 100) {
                 self.addGainElement(self._mediaElement);
                 self.updateGainNode();
             }
@@ -558,7 +558,7 @@ class HtmlAudioPlayer {
             return;
         }
 
-        let volumeLevel = htmlMediaHelper.clampVolumeLevel(val);
+        let volumeLevel = Math.min(htmlMediaHelper.clampVolumeLevel(val), this.getMaxVolumeLevel());
         if (volumeLevel > 100 && !this.gainNode && !this.addGainElement(mediaElement)) {
             volumeLevel = 100;
         }
@@ -581,7 +581,7 @@ class HtmlAudioPlayer {
     }
 
     volumeUp() {
-        this.setVolume(Math.min(this.getVolume() + 2, 150));
+        this.setVolume(Math.min(this.getVolume() + 2, this.getMaxVolumeLevel()));
     }
 
     volumeDown() {
@@ -601,6 +601,16 @@ class HtmlAudioPlayer {
             return mediaElement.muted;
         }
         return false;
+    }
+
+    getMaxVolumeLevel() {
+        const audioStream = this._currentPlayOptions?.mediaSource?.MediaStreams
+            ?.find(stream => stream.Type === 'Audio');
+        if (audioStream?.Channels > 2) {
+            return 100;
+        }
+
+        return 150;
     }
 
     isAirPlayEnabled() {

@@ -232,6 +232,10 @@ export class HtmlVideoPlayer {
      */
     #audioTrackIndexToSetOnPlaying;
     /**
+     * @type {number | null | undefined}
+     */
+    #audioStreamIndex;
+    /**
      * @type {any | null | undefined}
      */
     #currentAssRenderer;
@@ -537,6 +541,7 @@ export class HtmlVideoPlayer {
             secondaryTrackValid = false;
         }
 
+        this.#audioStreamIndex = options.mediaSource.DefaultAudioStreamIndex;
         this.#audioTrackIndexToSetOnPlaying = options.playMethod === 'Transcode' ? null : options.mediaSource.DefaultAudioStreamIndex;
 
         this._currentPlayOptions = options;
@@ -807,6 +812,7 @@ export class HtmlVideoPlayer {
     }
 
     setAudioStreamIndex(index) {
+        this.#audioStreamIndex = index;
         const streams = this.getSupportedAudioStreams();
 
         if (streams.length < 2) {
@@ -1020,7 +1026,7 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
-        if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+        if (this.getMaxVolumeLevel() > 100) {
             this.#ensureVolumeBoost();
             this.#applyVolumeBoost(this.#volumeLevel ?? getVolumeLevelFromElementVolume(elem.volume));
         }
@@ -2123,6 +2129,13 @@ export class HtmlVideoPlayer {
     }
 
     #applyVolumeBoost(volumeLevel) {
+        if (this.getMaxVolumeLevel() <= 100) {
+            if (this.#gainNode) {
+                this.#gainNode.gain.value = 1;
+            }
+            return volumeLevel <= 100;
+        }
+
         if (volumeLevel > 100) {
             const gainNode = this.#ensureVolumeBoost();
             if (!gainNode) {
@@ -2142,7 +2155,7 @@ export class HtmlVideoPlayer {
             return;
         }
 
-        let volumeLevel = clampVolumeLevel(val);
+        let volumeLevel = Math.min(clampVolumeLevel(val), this.getMaxVolumeLevel());
         const canApplyVolume = this.#applyVolumeBoost(volumeLevel);
         if (volumeLevel > 100 && !canApplyVolume) {
             volumeLevel = 100;
@@ -2166,7 +2179,7 @@ export class HtmlVideoPlayer {
     }
 
     volumeUp() {
-        this.setVolume(Math.min(this.getVolume() + 2, 150));
+        this.setVolume(Math.min(this.getVolume() + 2, this.getMaxVolumeLevel()));
     }
 
     volumeDown() {
@@ -2186,6 +2199,27 @@ export class HtmlVideoPlayer {
             return mediaElement.muted;
         }
         return false;
+    }
+
+    getCurrentAudioStream() {
+        const mediaSource = this._currentPlayOptions?.mediaSource;
+        if (!mediaSource) {
+            return null;
+        }
+
+        const audioStreams = getMediaStreamAudioTracks(mediaSource);
+        const streamIndex = this.#audioStreamIndex ?? mediaSource.DefaultAudioStreamIndex;
+
+        return audioStreams.find(stream => stream.Index === streamIndex) || audioStreams[0] || null;
+    }
+
+    getMaxVolumeLevel() {
+        const audioStream = this.getCurrentAudioStream();
+        if (audioStream?.Channels > 2) {
+            return 100;
+        }
+
+        return 150;
     }
 
     #applyAspectRatio(val = this.getAspectRatio()) {
