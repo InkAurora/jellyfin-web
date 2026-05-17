@@ -1020,6 +1020,11 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
+        if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+            this.#ensureVolumeBoost();
+            this.#applyVolumeBoost(this.#volumeLevel ?? getVolumeLevelFromElementVolume(elem.volume));
+        }
+
         if (!this.#started) {
             this.#started = true;
             elem.removeAttribute('controls');
@@ -2091,6 +2096,10 @@ export class HtmlVideoPlayer {
             this.#audioContext = audioContext;
             this.#mediaElementSource = source;
             this.#gainNode = gainNode;
+
+            audioContext.resume?.().catch((err) => {
+                console.error('error resuming volume boost audio context', err);
+            });
 
             return gainNode;
         } catch (err) {

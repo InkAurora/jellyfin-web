@@ -309,6 +309,11 @@ class HtmlAudioPlayer {
         }
 
         function onPlaying(e) {
+            if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+                self.addGainElement(self._mediaElement);
+                self.updateGainNode();
+            }
+
             if (!self._started) {
                 self._started = true;
                 this.removeAttribute('controls');
@@ -509,6 +514,9 @@ class HtmlAudioPlayer {
             this.audioContext = audioCtx;
             this.mediaElementSource = source;
             this.gainNode = gainNode;
+            audioCtx.resume?.().catch((err) => {
+                console.error('error resuming volume boost audio context', err);
+            });
             return gainNode;
         } catch (e) {
             console.error('Web Audio API is not supported in this browser', e);
