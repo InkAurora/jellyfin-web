@@ -1359,7 +1359,7 @@ export class HtmlVideoPlayer {
      */
     renderPgs(videoElement, track, item) {
         import('libpgs').then((libpgs) => {
-            const aspectRatio = this.getAspectRatio() === 'auto' ? 'contain' : this.getAspectRatio();
+            const aspectRatio = this.getPgsRenderAspectRatio();
             const options = {
                 video: videoElement,
                 subUrl: getTextTrackUrl(track, item),
@@ -1369,6 +1369,14 @@ export class HtmlVideoPlayer {
             };
             this.#currentPgsRenderer = new libpgs.PgsRenderer(options);
         });
+    }
+
+    getPgsRenderAspectRatio(aspectRatio = this._currentPlayOptions?.aspectRatio || this.getAspectRatio()) {
+        if (appSettings.get('subtitlepgsrendermode') === 'screensafearea') {
+            return 'contain';
+        }
+
+        return aspectRatio === 'auto' ? 'contain' : aspectRatio;
     }
 
     /**
@@ -2092,7 +2100,7 @@ export class HtmlVideoPlayer {
         }
 
         if (this.#currentPgsRenderer) {
-            this.#currentPgsRenderer.aspectRatio = val === 'auto' ? 'contain' : val;
+            this.#currentPgsRenderer.aspectRatio = this.getPgsRenderAspectRatio(val);
         }
     }
 

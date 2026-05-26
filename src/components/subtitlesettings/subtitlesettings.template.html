@@ -40,6 +40,14 @@
             </label>
             <div class="fieldDescription checkboxFieldDescription">${RenderPgsSubtitleHelp}</div>
         </div>
+
+        <div class="selectContainer fldRenderPgs fldPgsRenderMode hide">
+            <select is="emby-select" id="selectSubtitlePgsRenderMode" label="${LabelPgsSubtitleRenderMode}">
+                <option value="followvideozoom">${PgsSubtitleRenderModeFollowVideoZoom}</option>
+                <option value="screensafearea">${PgsSubtitleRenderModeScreenSafeArea}</option>
+            </select>
+            <div class="fieldDescription">${PgsSubtitleRenderModeHelp}</div>
+        </div>
     </div>
 
     <div class="checkboxContainer checkboxContainer-withDescription">
