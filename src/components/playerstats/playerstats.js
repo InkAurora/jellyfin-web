@@ -8,6 +8,7 @@ import layoutManager from '../layoutManager';
 import { playbackManager } from '../playback/playbackmanager';
 import playMethodHelper from '../playback/playmethodhelper';
 import { pluginManager } from '../pluginManager';
+import datetime from '../../scripts/datetime';
 
 import 'elements/emby-button/paper-icon-button-light';
 
@@ -195,6 +196,48 @@ function getDisplayTranscodeFps(session, player) {
     }
 
     return `${transcodeFramerate} fps (${(transcodeFramerate / originalFramerate).toFixed(2)}x)`;
+}
+
+function getCurrentBufferStats(player) {
+    const ranges = playbackManager.getBufferedRanges(player);
+    if (!ranges.length) {
+        return [];
+    }
+
+    let currentTicks;
+    try {
+        currentTicks = playbackManager.getCurrentTicks(player);
+    } catch {
+        return [];
+    }
+
+    let forwardBufferTicks = 0;
+    let totalBufferTicks = 0;
+
+    for (let i = 0, length = ranges.length; i < length; i++) {
+        const range = ranges[i];
+        const start = range.start;
+        const end = range.end;
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+            continue;
+        }
+
+        totalBufferTicks += end - start;
+
+        if (currentTicks >= start && currentTicks <= end) {
+            forwardBufferTicks = Math.max(forwardBufferTicks, end - currentTicks);
+        }
+    }
+
+    if (!totalBufferTicks) {
+        return [];
+    }
+
+    return [{
+        label: globalize.translate('LabelCurrentBuffer'),
+        value: `${datetime.getDisplayRunningTime(forwardBufferTicks)} / ${datetime.getDisplayRunningTime(totalBufferTicks)}`
+    }];
 }
 
 function getMediaSourceStats(session, player) {
@@ -408,6 +451,7 @@ function getStats(instance, player) {
             label: globalize.translate('LabelPlayer'),
             value: playerInfos.join('  ')
         });
+        baseCategory.stats.push(...getCurrentBufferStats(player));
 
         const categories = [];
         categories.push(baseCategory);

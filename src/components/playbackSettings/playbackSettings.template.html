@@ -198,6 +198,11 @@
             <div class="fieldDescription checkboxFieldDescription">${LimitSegmentLengthHelp}</div>
         </div>
 
+        <div class="inputContainer inputContainer-withDescription">
+            <input is="emby-input" type="number" id="txtHlsForwardBufferLength" pattern="[0-9]*" required="required" min="0" max="600" step="1" label="${LabelHlsForwardBufferLength}" />
+            <div class="fieldDescription">${LabelHlsForwardBufferLengthHelp}</div>
+        </div>
+
         <div class="selectContainer">
             <select is="emby-select" id="selectPreferredTranscodeVideoCodec" label="${LabelSelectPreferredTranscodeVideoCodec}">
                 <option value="">${Auto}</option>

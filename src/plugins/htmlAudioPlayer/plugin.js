@@ -1,4 +1,5 @@
 import { AppFeature } from 'constants/appFeature';
+import { currentSettings as currentUserSettings } from 'scripts/settings/userSettings';
 import { MediaError } from 'types/mediaError';
 
 import browser from '../../scripts/browser';
@@ -58,6 +59,27 @@ function requireHlsPlayer(callback) {
         window.Hls = hls;
         callback();
     });
+}
+
+const CUSTOM_HLS_BACK_BUFFER_LENGTH = 30;
+
+function getHlsOptions(includeCorsCredentials) {
+    const options = {
+        manifestLoadingTimeOut: 20000,
+        xhrSetup: function (xhr) {
+            xhr.withCredentials = includeCorsCredentials;
+        }
+    };
+
+    const maxBufferLength = currentUserSettings.hlsForwardBufferLength();
+    if (maxBufferLength > 0) {
+        options.maxBufferLength = maxBufferLength;
+        options.maxMaxBufferLength = maxBufferLength;
+        options.backBufferLength = CUSTOM_HLS_BACK_BUFFER_LENGTH;
+        options.liveBackBufferLength = CUSTOM_HLS_BACK_BUFFER_LENGTH;
+    }
+
+    return options;
 }
 
 function enableHlsPlayer(url, item, mediaSource, mediaType) {
@@ -169,12 +191,7 @@ class HtmlAudioPlayer {
                     requireHlsPlayer(async () => {
                         const includeCorsCredentials = await getIncludeCorsCredentials();
 
-                        const hls = new Hls({
-                            manifestLoadingTimeOut: 20000,
-                            xhrSetup: function (xhr) {
-                                xhr.withCredentials = includeCorsCredentials;
-                            }
-                        });
+                        const hls = new Hls(getHlsOptions(includeCorsCredentials));
                         hls.loadSource(val);
                         hls.attachMedia(elem);
 

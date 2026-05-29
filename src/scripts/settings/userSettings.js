@@ -169,6 +169,22 @@ export class UserSettings {
     }
 
     /**
+     * Get or set HLS max forward buffer length in seconds. 0 uses client defaults.
+     * @param {number|string|undefined} val - HLS max forward buffer length.
+     * @returns {number} HLS max forward buffer length in seconds.
+     */
+    hlsForwardBufferLength(val) {
+        if (val !== undefined) {
+            const parsedValue = parseInt(val, 10);
+            const value = Number.isFinite(parsedValue) ? Math.max(0, Math.min(parsedValue, 600)) : 0;
+            return this.set('hlsForwardBufferLength', value.toString(), false);
+        }
+
+        const savedValue = parseInt(this.get('hlsForwardBufferLength', false), 10);
+        return Number.isFinite(savedValue) ? Math.max(0, Math.min(savedValue, 600)) : 0;
+    }
+
+    /**
      * Get or set 'Cinema Mode' state.
      * @param {boolean|undefined} val - Flag to enable 'Cinema Mode' or undefined.
      * @return {boolean} 'Cinema Mode' state.
@@ -686,6 +702,7 @@ export const serverConfig = currentSettings.serverConfig.bind(currentSettings);
 export const allowedAudioChannels = currentSettings.allowedAudioChannels.bind(currentSettings);
 export const preferFmp4HlsContainer = currentSettings.preferFmp4HlsContainer.bind(currentSettings);
 export const limitSegmentLength = currentSettings.limitSegmentLength.bind(currentSettings);
+export const hlsForwardBufferLength = currentSettings.hlsForwardBufferLength.bind(currentSettings);
 export const enableCinemaMode = currentSettings.enableCinemaMode.bind(currentSettings);
 export const selectAudioNormalization = currentSettings.selectAudioNormalization.bind(currentSettings);
 export const enableNextVideoInfoOverlay = currentSettings.enableNextVideoInfoOverlay.bind(currentSettings);

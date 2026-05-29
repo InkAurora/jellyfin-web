@@ -128,6 +128,36 @@ function requireHlsPlayer(callback) {
     });
 }
 
+const CUSTOM_HLS_BACK_BUFFER_LENGTH = 30;
+
+function getHlsBufferOptions(player) {
+    const savedBufferLength = userSettings.hlsForwardBufferLength();
+    if (savedBufferLength > 0) {
+        return {
+            maxBufferLength: savedBufferLength,
+            maxMaxBufferLength: savedBufferLength,
+            backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
+            liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
+        };
+    }
+
+    // Some browsers cannot handle huge fragments in high bitrate.
+    // This issue usually happens when using HWA encoders with a high bitrate setting.
+    // Limit the BufferLength to 6s, it works fine when playing 4k 120Mbps over HLS on chrome.
+    // https://github.com/video-dev/hls.js/issues/876
+    if ((browser.chrome || browser.edgeChromium || browser.firefox) && playbackManager.getMaxStreamingBitrate(player) >= 25000000) {
+        return {
+            maxBufferLength: 6,
+            maxMaxBufferLength: 6
+        };
+    }
+
+    return {
+        maxBufferLength: 30,
+        maxMaxBufferLength: 30
+    };
+}
+
 function getMediaStreamVideoTracks(mediaSource) {
     return mediaSource.MediaStreams.filter(function (s) {
         return s.Type === 'Video';
@@ -444,23 +474,14 @@ export class HtmlVideoPlayer {
     setSrcWithHlsJs(elem, options, url) {
         return new Promise((resolve, reject) => {
             requireHlsPlayer(async () => {
-                let maxBufferLength = 30;
-
-                // Some browsers cannot handle huge fragments in high bitrate.
-                // This issue usually happens when using HWA encoders with a high bitrate setting.
-                // Limit the BufferLength to 6s, it works fine when playing 4k 120Mbps over HLS on chrome.
-                // https://github.com/video-dev/hls.js/issues/876
-                if ((browser.chrome || browser.edgeChromium || browser.firefox) && playbackManager.getMaxStreamingBitrate(this) >= 25000000) {
-                    maxBufferLength = 6;
-                }
+                const hlsBufferOptions = getHlsBufferOptions(this);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,
                     manifestLoadingTimeOut: 20000,
-                    maxBufferLength: maxBufferLength,
-                    maxMaxBufferLength: maxBufferLength,
+                    ...hlsBufferOptions,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;
