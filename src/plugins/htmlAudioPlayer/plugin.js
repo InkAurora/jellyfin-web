@@ -61,7 +61,7 @@ function requireHlsPlayer(callback) {
     });
 }
 
-const CUSTOM_HLS_BACK_BUFFER_LENGTH = 30;
+const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
 
 function getHlsOptions(includeCorsCredentials) {
     const options = {

@@ -128,7 +128,7 @@ function requireHlsPlayer(callback) {
     });
 }
 
-const CUSTOM_HLS_BACK_BUFFER_LENGTH = 30;
+const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
 
 function getHlsBufferOptions(player) {
     const savedBufferLength = userSettings.hlsForwardBufferLength();
