@@ -15,11 +15,14 @@ const normalizeImageOptions = options => {
     }
 };
 
+const MAX_BITRATE = 2147483647;
+const LAN_BITRATE = 140000000;
+const BITRATE_CACHE_DURATION = 60 * 60 * 1000;
+
 const getMaxBandwidth = () => {
     if (navigator.connection) {
         let max = navigator.connection.downlinkMax;
         if (max && max > 0 && max < Number.POSITIVE_INFINITY) {
-            max /= 8;
             max *= 1000000;
             max *= 0.7;
             return parseInt(max, 10);
@@ -27,6 +30,66 @@ const getMaxBandwidth = () => {
     }
 
     return null;
+};
+
+const normalizeBitrate = (apiClient, bitrate) => {
+    if (!bitrate) {
+        if (apiClient.lastDetectedBitrate) {
+            return apiClient.lastDetectedBitrate;
+        }
+
+        return null;
+    }
+
+    let result = Math.min(Math.round(bitrate * 0.7), MAX_BITRATE);
+    const maxRate = getMaxBandwidth();
+
+    if (maxRate) {
+        result = Math.min(result, maxRate);
+    }
+
+    apiClient.lastDetectedBitrate = result;
+    apiClient.lastDetectedBitrateTime = Date.now();
+
+    return result;
+};
+
+const detectBitrate = apiClient => async force => {
+    if (!force && apiClient.lastDetectedBitrate && Date.now() - (apiClient.lastDetectedBitrateTime || 0) <= BITRATE_CACHE_DURATION) {
+        return apiClient.lastDetectedBitrate;
+    }
+
+    let endpointInfo = {};
+    try {
+        endpointInfo = await apiClient.getEndpointInfo();
+    } catch {
+        // Preserve the upstream behavior: bitrate detection can continue without endpoint info.
+    }
+
+    const tests = [1000000, 3000000, 10000000];
+    let bestBitrate = 0;
+
+    for (const byteSize of tests) {
+        try {
+            bestBitrate = Math.max(bestBitrate, await apiClient.getDownloadSpeed(byteSize));
+        } catch {
+            break;
+        }
+    }
+
+    let result = normalizeBitrate(apiClient, bestBitrate);
+
+    if (endpointInfo.IsInNetwork) {
+        result = Math.max(result || 0, LAN_BITRATE);
+        apiClient.lastDetectedBitrate = result;
+        apiClient.lastDetectedBitrateTime = Date.now();
+    }
+
+    if (!result) {
+        return Promise.reject();
+    }
+
+    return result;
 };
 
 class ServerConnections extends ConnectionManager {
@@ -50,6 +113,7 @@ class ServerConnections extends ConnectionManager {
         Events.on(this, 'apiclientcreated', (_e, apiClient) => {
             apiClient.getMaxBandwidth = getMaxBandwidth;
             apiClient.normalizeImageOptions = normalizeImageOptions;
+            apiClient.detectBitrate = detectBitrate(apiClient);
         });
     }
 
