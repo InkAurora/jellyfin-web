@@ -198,9 +198,20 @@ function getHlsAbrOptions(options) {
 
     const initialBandwidthEstimate = parseInt(options.initialBandwidthEstimate, 10);
     const abrOptions = {
-        capLevelOnFPSDrop: true,
+        capLevelOnFPSDrop: !(browser.iOS || browser.safari),
+        testBandwidth: false,
         startLevel: options.initialMaxStreamingBitrate ? undefined : -1
     };
+
+    if (browser.iOS || browser.safari) {
+        Object.assign(abrOptions, {
+            abrEwmaFastVoD: 1.5,
+            abrEwmaSlowVoD: 3,
+            abrBandWidthUpFactor: 0.85,
+            maxStarvationDelay: 8,
+            maxLoadingDelay: 8
+        });
+    }
 
     if (Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0) {
         const bandwidthEstimate = Math.max(initialBandwidthEstimate, MIN_HLS_BANDWIDTH_ESTIMATE);
