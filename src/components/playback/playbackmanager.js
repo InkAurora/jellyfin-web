@@ -35,6 +35,22 @@ import { toApi } from 'utils/jellyfin-apiclient/compat';
 import { bindSkipSegment } from './skipsegment.ts';
 
 const UNLIMITED_ITEMS = -1;
+const VIDEO_QUALITY_BITRATES = [
+    120000000,
+    80000000,
+    60000000,
+    40000000,
+    20000000,
+    15000000,
+    10000000,
+    8000000,
+    6000000,
+    4000000,
+    3000000,
+    1500000,
+    720000,
+    420000
+];
 
 function enableLocalPlaylistManagement(player) {
     if (player.getPlaylist) {
@@ -46,6 +62,14 @@ function enableLocalPlaylistManagement(player) {
 
 function supportsPhysicalVolumeControl(player) {
     return player.isLocalPlayer && appHost.supports(AppFeature.PhysicalVolumeControl);
+}
+
+function getAdaptiveBitrateManifestMaxBitrate(player, item, selectedBitrate) {
+    if (item.MediaType !== 'Video' || !player.supportsAdaptiveBitrate?.(item)) {
+        return selectedBitrate;
+    }
+
+    return Math.max(selectedBitrate || 0, VIDEO_QUALITY_BITRATES[0]);
 }
 
 function bindToFullscreenChange(player) {
@@ -480,6 +504,10 @@ async function getPlaybackInfo(player, apiClient, item, deviceProfile, mediaSour
     if (options.maxBitrate) {
         query.MaxStreamingBitrate = options.maxBitrate;
     }
+    if (item.MediaType === 'Video' && options.isPlayback && player.supportsAdaptiveBitrate?.(item)) {
+        query.EnableAdaptiveBitrateStreaming = true;
+        query.AllowVideoStreamCopy = false;
+    }
     if (player.enableMediaProbe && !player.enableMediaProbe(item)) {
         query.EnableMediaProbe = false;
     }
@@ -549,6 +577,10 @@ function getLiveStream(player, apiClient, item, playSessionId, deviceProfile, me
 
     if (options.maxBitrate) {
         query.MaxStreamingBitrate = options.maxBitrate;
+    }
+    if (item.MediaType === 'Video' && options.isPlayback && player.supportsAdaptiveBitrate?.(item)) {
+        query.EnableAdaptiveBitrateStreaming = true;
+        query.AllowVideoStreamCopy = false;
     }
     if (options.audioStreamIndex != null) {
         query.AudioStreamIndex = options.audioStreamIndex;
@@ -1360,7 +1392,10 @@ export class PlaybackManager {
         self.getMaxStreamingBitrate = function (player) {
             player = player || self._currentPlayer;
             if (player?.getMaxStreamingBitrate) {
-                return player.getMaxStreamingBitrate();
+                const playerBitrate = player.getMaxStreamingBitrate();
+                if (playerBitrate != null) {
+                    return playerBitrate;
+                }
             }
 
             const playerData = getPlayerData(player);
@@ -1379,7 +1414,10 @@ export class PlaybackManager {
         self.enableAutomaticBitrateDetection = function (player) {
             player = player || self._currentPlayer;
             if (player?.enableAutomaticBitrateDetection) {
-                return player.enableAutomaticBitrateDetection();
+                const enableAutomaticBitrateDetection = player.enableAutomaticBitrateDetection();
+                if (enableAutomaticBitrateDetection != null) {
+                    return enableAutomaticBitrateDetection;
+                }
             }
 
             const playerData = getPlayerData(player);
@@ -1394,13 +1432,10 @@ export class PlaybackManager {
 
         self.setMaxStreamingBitrate = function (options, player) {
             player = player || self._currentPlayer;
-            if (player?.setMaxStreamingBitrate) {
-                return player.setMaxStreamingBitrate(options);
-            }
 
             const apiClient = ServerConnections.getApiClient(self.currentItem(player).ServerId);
 
-            apiClient.getEndpointInfo().then(function (endpointInfo) {
+            return apiClient.getEndpointInfo().then(function (endpointInfo) {
                 const playerData = getPlayerData(player);
                 const mediaType = playerData.streamInfo ? playerData.streamInfo.mediaType : null;
 
@@ -1413,7 +1448,23 @@ export class PlaybackManager {
                     promise = Promise.resolve(options.maxBitrate);
                 }
 
-                promise.then(function (bitrate) {
+                return promise.then(function (bitrate) {
+                    if (player?.setMaxStreamingBitrate) {
+                        const handled = player.setMaxStreamingBitrate({
+                            ...options,
+                            maxBitrate: bitrate
+                        });
+
+                        if (handled !== false) {
+                            appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
+                            return handled;
+                        }
+
+                        if (player.supportsAdaptiveBitrate?.(self.currentItem(player))) {
+                            return false;
+                        }
+                    }
+
                     appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
 
                     changeStream(player, getCurrentTicks(player), {
@@ -2654,17 +2705,19 @@ export class PlaybackManager {
 
                 const audioStreamIndex = playOptions.audioStreamIndex;
                 const subtitleStreamIndex = playOptions.subtitleStreamIndex;
+                const supportsAdaptiveBitrate = player.supportsAdaptiveBitrate?.(item);
+                const manifestMaxBitrate = getAdaptiveBitrateManifestMaxBitrate(player, item, maxBitrate);
                 const options = {
                     aspectRatio: playOptions.aspectRatio,
-                    maxBitrate,
+                    maxBitrate: manifestMaxBitrate,
                     startPosition,
-                    isPlayback: null,
+                    isPlayback: true,
                     audioStreamIndex,
                     subtitleStreamIndex,
                     startIndex: playOptions.startIndex,
                     enableDirectPlay: null,
                     enableDirectStream: null,
-                    allowVideoStreamCopy: null,
+                    allowVideoStreamCopy: supportsAdaptiveBitrate ? false : null,
                     allowAudioStreamCopy: null
                 };
 
@@ -2713,6 +2766,10 @@ export class PlaybackManager {
                     }
 
                     const streamInfo = createStreamInfo(apiClient, item.MediaType, item, mediaSource, startPosition, player);
+                    const endpointInfo = apiClient.getSavedEndpointInfo() || {};
+                    if (!appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType)) {
+                        streamInfo.initialMaxStreamingBitrate = maxBitrate;
+                    }
                     streamInfo.aspectRatio = playOptions.aspectRatio;
                     streamInfo.fullscreen = playOptions.fullscreen;
 
@@ -2811,6 +2868,7 @@ export class PlaybackManager {
             let transcodingOffsetTicks = 0;
             const playerStartPositionTicks = startPosition;
             const liveStreamId = mediaSource.LiveStreamId;
+            let adaptiveBitrateStreaming = false;
 
             let playMethod = 'Transcode';
 
@@ -2860,6 +2918,14 @@ export class PlaybackManager {
                     mediaUrl = apiClient.getUrl(mediaSource.TranscodingUrl);
 
                     if (mediaSource.TranscodingSubProtocol === 'hls') {
+                        if (type === 'Video' && player.supportsAdaptiveBitrate?.(item)) {
+                            const url = new URL(mediaUrl);
+                            url.searchParams.set('EnableAdaptiveBitrateStreaming', 'true');
+                            url.searchParams.set('AllowVideoStreamCopy', 'false');
+                            mediaUrl = url.toString();
+                            adaptiveBitrateStreaming = true;
+                        }
+
                         contentType = 'application/x-mpegURL';
                     } else {
                         contentType = getMimeType(type.toLowerCase(), mediaSource.TranscodingContainer);
@@ -2893,6 +2959,7 @@ export class PlaybackManager {
                 // TODO: Deprecate
                 tracks: getTextTracks(apiClient, item, mediaSource),
                 mediaType: type,
+                adaptiveBitrateStreaming,
                 liveStreamId: liveStreamId,
                 playSessionId: getParam('playSessionId', mediaUrl),
                 title: item.Name

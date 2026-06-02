@@ -5,6 +5,7 @@ import { ServerConnections } from 'lib/jellyfin-apiclient';
 import qualityoptions from '../qualityOptions';
 
 function showQualityMenu(player, btn) {
+    const currentItem = playbackManager.currentItem(player);
     const videoStream = playbackManager.currentMediaSource(player).MediaStreams.filter(function (stream) {
         return stream.Type === 'Video';
     })[0];
@@ -17,6 +18,8 @@ function showQualityMenu(player, btn) {
         isAutomaticBitrateEnabled: playbackManager.enableAutomaticBitrateDetection(player),
         videoCodec,
         videoBitRate,
+        includeAllVideoBitrates: player?.supportsAdaptiveBitrate?.(currentItem),
+        supportedVideoBitrates: player?.getSupportedStreamingBitrates?.(),
         enableAuto: true
     });
 
@@ -88,6 +91,7 @@ function showRepeatModeMenu(player, btn) {
 
 function getQualitySecondaryText(player) {
     const state = playbackManager.getPlayerState(player);
+    const currentItem = playbackManager.currentItem(player);
 
     const videoStream = playbackManager.currentMediaSource(player).MediaStreams.filter(function (stream) {
         return stream.Type === 'Video';
@@ -105,6 +109,8 @@ function getQualitySecondaryText(player) {
         videoBitRate,
         videoWidth: videoWidth,
         videoHeight: videoHeight,
+        includeAllVideoBitrates: player?.supportsAdaptiveBitrate?.(currentItem),
+        supportedVideoBitrates: player?.getSupportedStreamingBitrates?.(),
         enableAuto: true
     });
 

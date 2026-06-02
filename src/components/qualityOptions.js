@@ -37,7 +37,9 @@ export function getVideoQualityOptions(options) {
         qualityOptions.push(autoQualityOption);
     }
 
-    if (videoBitRate > 0 && videoBitRate < bitrateConfigurations[0].bitrate) {
+    if (options.includeAllVideoBitrates) {
+        qualityOptions.push(...bitrateConfigurations);
+    } else if (videoBitRate > 0 && videoBitRate < bitrateConfigurations[0].bitrate) {
         // Slightly increase reference bitrate for high efficiency codecs when it is not too high
         // Ideally we only need to do this for transcoding to h264, but we need extra api request to get that info which is not ideal for this
         if (videoCodec && ['hevc', 'av1', 'vp9'].includes(videoCodec) && referenceBitRate <= 20000000) {
@@ -48,11 +50,13 @@ export function getVideoQualityOptions(options) {
         qualityOptions.push(sourceOptions);
     }
 
-    bitrateConfigurations.forEach((c) => {
-        if (videoBitRate <= 0 || c.bitrate <= referenceBitRate) {
-            qualityOptions.push(c);
-        }
-    });
+    if (!options.includeAllVideoBitrates) {
+        bitrateConfigurations.forEach((c) => {
+            if (videoBitRate <= 0 || c.bitrate <= referenceBitRate) {
+                qualityOptions.push(c);
+            }
+        });
+    }
 
     if (maxStreamingBitrate) {
         let selectedIndex = qualityOptions.length - 1;

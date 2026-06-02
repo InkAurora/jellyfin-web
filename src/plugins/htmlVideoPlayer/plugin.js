@@ -22,6 +22,7 @@ import {
     destroyFlvPlayer,
     destroyCastPlayer,
     getCrossOriginValue,
+    enableHlsJsPlayer,
     enableHlsJsPlayerForCodecs,
     applySrc,
     resetSrc,
@@ -128,14 +129,77 @@ function requireHlsPlayer(callback) {
     });
 }
 
-const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
+function getHlsLevelBitrate(level) {
+    const bitrate = level?.bitrate || level?.attrs?.BANDWIDTH || level?.attrs?.AVERAGE_BANDWIDTH;
+    return parseInt(bitrate, 10) || 0;
+}
 
-function getHlsBufferOptions(player) {
+function getManualHlsLevelForBitrate(levels, maxBitrate) {
+    let selectedIndex = -1;
+    let selectedBitrate = 0;
+    let lowestIndex = -1;
+    let lowestBitrate = Number.MAX_SAFE_INTEGER;
+    let highestIndex = -1;
+    let highestBitrate = 0;
+
+    for (let i = 0, length = levels.length; i < length; i++) {
+        const bitrate = getHlsLevelBitrate(levels[i]);
+        if (!bitrate) {
+            continue;
+        }
+
+        if (bitrate > highestBitrate) {
+            highestBitrate = bitrate;
+            highestIndex = i;
+        }
+
+        if (bitrate < lowestBitrate) {
+            lowestBitrate = bitrate;
+            lowestIndex = i;
+        }
+
+        if (bitrate <= maxBitrate && bitrate > selectedBitrate) {
+            selectedBitrate = bitrate;
+            selectedIndex = i;
+        }
+    }
+
+    if (!highestBitrate) {
+        return -1;
+    }
+
+    if (maxBitrate > highestBitrate) {
+        return highestIndex;
+    }
+
+    if (maxBitrate < lowestBitrate) {
+        return lowestIndex;
+    }
+
+    return selectedIndex === -1 ? lowestIndex : selectedIndex;
+}
+
+const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
+const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 30;
+const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 512 * 1024 * 1024;
+
+function getHlsBufferOptions(player, options) {
     const savedBufferLength = userSettings.hlsForwardBufferLength();
     if (savedBufferLength > 0) {
         return {
             maxBufferLength: savedBufferLength,
             maxMaxBufferLength: savedBufferLength,
+            ...(options.adaptiveBitrateStreaming ? { maxBufferSize: CUSTOM_ABR_HLS_MAX_BUFFER_SIZE } : {}),
+            backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
+            liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
+        };
+    }
+
+    if (options.adaptiveBitrateStreaming) {
+        return {
+            maxBufferLength: CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH,
+            maxMaxBufferLength: CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH,
+            maxBufferSize: CUSTOM_ABR_HLS_MAX_BUFFER_SIZE,
             backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
             liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
         };
@@ -474,13 +538,14 @@ export class HtmlVideoPlayer {
     setSrcWithHlsJs(elem, options, url) {
         return new Promise((resolve, reject) => {
             requireHlsPlayer(async () => {
-                const hlsBufferOptions = getHlsBufferOptions(this);
+                const hlsBufferOptions = getHlsBufferOptions(this, options);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
 
                 const hls = new Hls({
                     startPosition: options.playerStartPositionTicks / 10000000,
                     manifestLoadingTimeOut: 20000,
+                    preserveManualLevelOnError: true,
                     ...hlsBufferOptions,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
@@ -489,6 +554,15 @@ export class HtmlVideoPlayer {
                 });
                 hls.loadSource(url);
                 hls.attachMedia(elem);
+
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    if (options.initialMaxStreamingBitrate) {
+                        const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
+                        if (level !== -1) {
+                            hls.loadLevel = level;
+                        }
+                    }
+                });
 
                 bindEventsToHlsPlayer(this, hls, elem, this.onError, resolve, reject);
 
@@ -1756,6 +1830,60 @@ export class HtmlVideoPlayer {
      */
     canPlayMediaType(mediaType) {
         return (mediaType || '').toLowerCase() === 'video';
+    }
+
+    supportsAdaptiveBitrate(item) {
+        return item?.MediaType === 'Video' && enableHlsJsPlayer(item.RunTimeTicks, 'Video');
+    }
+
+    getMaxStreamingBitrate() {
+        const hls = this._hlsPlayer;
+        if (!hls?.levels?.length || hls.levels.length < 2 || hls.autoLevelEnabled) {
+            return null;
+        }
+
+        const level = hls.manualLevel > -1 ? hls.manualLevel : hls.loadLevel;
+        return getHlsLevelBitrate(hls.levels[level]) || null;
+    }
+
+    enableAutomaticBitrateDetection() {
+        const hls = this._hlsPlayer;
+        if (!hls?.levels?.length || hls.levels.length < 2) {
+            return null;
+        }
+
+        return hls.autoLevelEnabled;
+    }
+
+    getSupportedStreamingBitrates() {
+        const hls = this._hlsPlayer;
+        if (!hls?.levels?.length || hls.levels.length < 2) {
+            return null;
+        }
+
+        return hls.levels
+            .map(getHlsLevelBitrate)
+            .filter(Boolean);
+    }
+
+    setMaxStreamingBitrate(options) {
+        const hls = this._hlsPlayer;
+        if (!hls?.levels?.length || hls.levels.length < 2) {
+            return false;
+        }
+
+        if (options.enableAutomaticBitrateDetection || !options.maxBitrate) {
+            hls.loadLevel = -1;
+            return true;
+        }
+
+        const level = getManualHlsLevelForBitrate(hls.levels, options.maxBitrate);
+        if (level === -1) {
+            return false;
+        }
+
+        hls.loadLevel = level;
+        return true;
     }
 
     /**
