@@ -134,6 +134,13 @@ function getHlsLevelBitrate(level) {
     return parseInt(bitrate, 10) || 0;
 }
 
+function getCurrentHlsLevelBitrate(hls) {
+    const level = [hls.currentLevel, hls.loadLevel, hls.nextAutoLevel, hls.firstLevel]
+        .find(levelIndex => levelIndex != null && levelIndex > -1);
+
+    return getHlsLevelBitrate(hls.levels[level]) || null;
+}
+
 function getManualHlsLevelForBitrate(levels, maxBitrate) {
     let selectedIndex = -1;
     let selectedBitrate = 0;
@@ -182,6 +189,27 @@ function getManualHlsLevelForBitrate(levels, maxBitrate) {
 const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
 const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 30;
 const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 512 * 1024 * 1024;
+const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
+
+function getHlsAbrOptions(options) {
+    if (!options.adaptiveBitrateStreaming) {
+        return {};
+    }
+
+    const initialBandwidthEstimate = parseInt(options.initialBandwidthEstimate, 10);
+    const abrOptions = {
+        capLevelOnFPSDrop: true,
+        startLevel: options.initialMaxStreamingBitrate ? undefined : -1
+    };
+
+    if (Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0) {
+        const bandwidthEstimate = Math.max(initialBandwidthEstimate, MIN_HLS_BANDWIDTH_ESTIMATE);
+        abrOptions.abrEwmaDefaultEstimate = bandwidthEstimate;
+        abrOptions.abrEwmaDefaultEstimateMax = Math.max(bandwidthEstimate, Hls.DefaultConfig.abrEwmaDefaultEstimateMax);
+    }
+
+    return abrOptions;
+}
 
 function getHlsBufferOptions(player, options) {
     const savedBufferLength = userSettings.hlsForwardBufferLength();
@@ -546,6 +574,7 @@ export class HtmlVideoPlayer {
                     startPosition: options.playerStartPositionTicks / 10000000,
                     manifestLoadingTimeOut: 20000,
                     preserveManualLevelOnError: true,
+                    ...getHlsAbrOptions(options),
                     ...hlsBufferOptions,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
@@ -1838,8 +1867,12 @@ export class HtmlVideoPlayer {
 
     getMaxStreamingBitrate() {
         const hls = this._hlsPlayer;
-        if (!hls?.levels?.length || hls.levels.length < 2 || hls.autoLevelEnabled) {
+        if (!hls?.levels?.length || hls.levels.length < 2) {
             return null;
+        }
+
+        if (hls.autoLevelEnabled) {
+            return getCurrentHlsLevelBitrate(hls);
         }
 
         const level = hls.manualLevel > -1 ? hls.manualLevel : hls.loadLevel;

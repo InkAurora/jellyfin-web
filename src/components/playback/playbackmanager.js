@@ -2767,7 +2767,9 @@ export class PlaybackManager {
 
                     const streamInfo = createStreamInfo(apiClient, item.MediaType, item, mediaSource, startPosition, player);
                     const endpointInfo = apiClient.getSavedEndpointInfo() || {};
-                    if (!appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType)) {
+                    if (appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType)) {
+                        streamInfo.initialBandwidthEstimate = maxBitrate;
+                    } else {
                         streamInfo.initialMaxStreamingBitrate = maxBitrate;
                     }
                     streamInfo.aspectRatio = playOptions.aspectRatio;
