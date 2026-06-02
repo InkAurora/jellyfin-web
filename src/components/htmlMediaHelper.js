@@ -28,6 +28,10 @@ function canPlayNativeHls() {
             || media.canPlayType('application/vnd.apple.mpegURL').replace(/no/, ''));
 }
 
+function canUseHlsJsMediaSource() {
+    return window.MediaSource != null || window.ManagedMediaSource != null;
+}
+
 export function enableHlsJsPlayerForCodecs(mediaSource, mediaType) {
     // Workaround for VP9 HLS support on desktop Safari
     // Force using HLS.js because desktop Safari's native HLS player does not play VP9 over HLS
@@ -39,12 +43,12 @@ export function enableHlsJsPlayerForCodecs(mediaSource, mediaType) {
 }
 
 export function enableHlsJsPlayer(runTimeTicks, mediaType) {
-    if (window.MediaSource == null) {
+    if (!canUseHlsJsMediaSource()) {
         return false;
     }
 
-    // hls.js is only in beta. needs more testing.
-    if (browser.iOS) {
+    // iOS needs MSE/ManagedMediaSource for hls.js. Without it, native HLS is the only usable path.
+    if (browser.iOS && window.ManagedMediaSource == null && window.MediaSource == null) {
         return false;
     }
 
@@ -54,6 +58,11 @@ export function enableHlsJsPlayer(runTimeTicks, mediaType) {
     }
 
     if (canPlayNativeHls()) {
+        // ABR/manual level switching requires hls.js; native Safari HLS does not expose level control.
+        if (mediaType === 'Video' && (browser.iOS || browser.safari)) {
+            return true;
+        }
+
         // Android Webview's native HLS has performance and compatiblity issues
         if (browser.android && (mediaType === 'Audio' || mediaType === 'Video')) {
             return true;

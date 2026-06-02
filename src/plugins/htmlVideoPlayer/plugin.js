@@ -2344,7 +2344,7 @@ export class HtmlVideoPlayer {
         categories.push(mediaCategory);
 
         const mediaInfos = [];
-        mediaInfos.push(this._hlsPlayer ? 'HLS' : 'Video');
+        mediaInfos.push(this._hlsPlayer || isHls(playOptions.mediaSource) ? 'HLS' : 'Video');
         if (playOptions.url) {
             //  create an anchor element (note: no need to append this element to the document)
             let link = document.createElement('a');
