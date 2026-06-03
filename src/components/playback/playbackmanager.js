@@ -72,6 +72,15 @@ function getAdaptiveBitrateManifestMaxBitrate(player, item, selectedBitrate) {
     return Math.max(selectedBitrate || 0, VIDEO_QUALITY_BITRATES[0]);
 }
 
+function isClientRenderedPgsSubtitle(subtitleStream) {
+    const subtitleBurninSetting = appSettings.get('subtitleburnin');
+    return (subtitleStream?.Codec || '').toLowerCase() === 'pgssub'
+        && appSettings.get('subtitlerenderpgs') === 'true'
+        && subtitleBurninSetting !== 'all'
+        && subtitleBurninSetting !== 'allcomplexformats'
+        && subtitleBurninSetting !== 'onlyimageformats';
+}
+
 function bindToFullscreenChange(player) {
     if (Screenfull.isEnabled) {
         Screenfull.on('change', function () {
@@ -1433,11 +1442,30 @@ export class PlaybackManager {
         self.setMaxStreamingBitrate = function (options, player) {
             player = player || self._currentPlayer;
 
-            const apiClient = ServerConnections.getApiClient(self.currentItem(player).ServerId);
+            const currentItem = self.currentItem(player);
+            const apiClient = ServerConnections.getApiClient(currentItem.ServerId);
 
             return apiClient.getEndpointInfo().then(function (endpointInfo) {
                 const playerData = getPlayerData(player);
                 const mediaType = playerData.streamInfo ? playerData.streamInfo.mediaType : null;
+                const supportsAdaptiveBitrate = player?.supportsAdaptiveBitrate?.(currentItem);
+
+                if (options.enableAutomaticBitrateDetection && supportsAdaptiveBitrate) {
+                    appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType, true);
+
+                    if (player?.setMaxStreamingBitrate) {
+                        const handled = player.setMaxStreamingBitrate({
+                            ...options,
+                            maxBitrate: null
+                        });
+
+                        if (handled !== false) {
+                            return handled;
+                        }
+                    }
+
+                    return false;
+                }
 
                 let promise;
                 if (options.enableAutomaticBitrateDetection) {
@@ -1550,6 +1578,10 @@ export class PlaybackManager {
         };
 
         function getDeliveryMethod(subtitleStream) {
+            if (isClientRenderedPgsSubtitle(subtitleStream)) {
+                return 'External';
+            }
+
             // This will be null for internal subs for local items
             if (subtitleStream.DeliveryMethod) {
                 return subtitleStream.DeliveryMethod;
@@ -2423,7 +2455,7 @@ export class PlaybackManager {
 
             return runInterceptors(item, playOptions)
                 .catch(onInterceptorRejection)
-                .then(() => detectBitrate(apiClient, item, mediaType))
+                .then(() => detectBitrate(apiClient, item, mediaType, playOptions))
                 .then((bitrate) => {
                     return playAfterBitrateDetect(bitrate, item, playOptions, onPlaybackStartedFn, prevSource)
                         .catch(onPlaybackRejection);
@@ -2544,7 +2576,7 @@ export class PlaybackManager {
 
             let bestStreamIndex = null;
             let bestStreamScore = 0;
-            const prevStream = prevSource.MediaStreams[prevIndex];
+            const prevStream = prevSource.MediaStreams.find(stream => stream.Type === streamType && stream.Index === prevIndex);
 
             if (!prevStream) {
                 console.debug(`AutoSet ${streamType} - No prevStream`);
@@ -2624,7 +2656,7 @@ export class PlaybackManager {
             }
         }
 
-        function detectBitrate(apiClient, item, mediaType) {
+        function detectBitrate(apiClient, item, mediaType, playOptions) {
             // FIXME: This is gnarly, but don't want to change too much here in a bugfix
             return Promise.resolve()
                 .then(() => {
@@ -2635,6 +2667,11 @@ export class PlaybackManager {
                     return apiClient.getEndpointInfo()
                         .then((endpointInfo) => {
                             if ((mediaType === 'Video' || mediaType === 'Audio') && appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType)) {
+                                const player = mediaType === 'Video' ? getPlayer(item, playOptions) : null;
+                                if (player?.supportsAdaptiveBitrate?.(item)) {
+                                    return VIDEO_QUALITY_BITRATES[0];
+                                }
+
                                 return apiClient.detectBitrate().then((bitrate) => {
                                     appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
                                     return bitrate;
@@ -2706,6 +2743,10 @@ export class PlaybackManager {
                 const audioStreamIndex = playOptions.audioStreamIndex;
                 const subtitleStreamIndex = playOptions.subtitleStreamIndex;
                 const supportsAdaptiveBitrate = player.supportsAdaptiveBitrate?.(item);
+                let clientRenderedSubtitleStreamIndex = supportsAdaptiveBitrate && subtitleStreamIndex != null
+                    && isClientRenderedPgsSubtitle(mediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === subtitleStreamIndex))
+                    ? subtitleStreamIndex
+                    : null;
                 const manifestMaxBitrate = getAdaptiveBitrateManifestMaxBitrate(player, item, maxBitrate);
                 const options = {
                     aspectRatio: playOptions.aspectRatio,
@@ -2713,7 +2754,7 @@ export class PlaybackManager {
                     startPosition,
                     isPlayback: true,
                     audioStreamIndex,
-                    subtitleStreamIndex,
+                    subtitleStreamIndex: clientRenderedSubtitleStreamIndex == null ? subtitleStreamIndex : null,
                     startIndex: playOptions.startIndex,
                     enableDirectPlay: null,
                     enableDirectStream: null,
@@ -2741,11 +2782,21 @@ export class PlaybackManager {
                     isIdFallbackNeeded = true;
                 }
 
+                if (supportsAdaptiveBitrate && options.subtitleStreamIndex != null
+                    && isClientRenderedPgsSubtitle(mediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === options.subtitleStreamIndex))) {
+                    clientRenderedSubtitleStreamIndex = options.subtitleStreamIndex;
+                    options.subtitleStreamIndex = null;
+                }
+
                 if (isIdFallbackNeeded) {
                     mediaSourceId ||= item.Id;
                 }
 
                 return getPlaybackMediaSource(player, apiClient, deviceProfile, item, mediaSourceId, options).then(async (mediaSource) => {
+                    if (clientRenderedSubtitleStreamIndex != null) {
+                        mediaSource.DefaultSubtitleStreamIndex = clientRenderedSubtitleStreamIndex;
+                    }
+
                     if (trackOptions.DefaultSecondarySubtitleStreamIndex != null) {
                         mediaSource.DefaultSecondarySubtitleStreamIndex = trackOptions.DefaultSecondarySubtitleStreamIndex;
                     }
@@ -2757,8 +2808,8 @@ export class PlaybackManager {
                         mediaSource.DefaultSecondarySubtitleStreamIndex = -1;
                     }
 
-                    const subtitleTrack1 = mediaSource.MediaStreams[mediaSource.DefaultSubtitleStreamIndex];
-                    const subtitleTrack2 = mediaSource.MediaStreams[mediaSource.DefaultSecondarySubtitleStreamIndex];
+                    const subtitleTrack1 = mediaSource.MediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === mediaSource.DefaultSubtitleStreamIndex);
+                    const subtitleTrack2 = mediaSource.MediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === mediaSource.DefaultSecondarySubtitleStreamIndex);
 
                     if (!self.trackHasSecondarySubtitleSupport(subtitleTrack1, player)
                         || !self.trackHasSecondarySubtitleSupport(subtitleTrack2, player)) {
@@ -2768,7 +2819,9 @@ export class PlaybackManager {
                     const streamInfo = createStreamInfo(apiClient, item.MediaType, item, mediaSource, startPosition, player);
                     const endpointInfo = apiClient.getSavedEndpointInfo() || {};
                     if (appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType)) {
-                        streamInfo.initialBandwidthEstimate = maxBitrate;
+                        if (!supportsAdaptiveBitrate) {
+                            streamInfo.initialBandwidthEstimate = maxBitrate;
+                        }
                     } else {
                         streamInfo.initialMaxStreamingBitrate = maxBitrate;
                     }
@@ -2778,8 +2831,14 @@ export class PlaybackManager {
                     const playerData = getPlayerData(player);
 
                     playerData.isChangingStream = false;
-                    playerData.maxStreamingBitrate = maxBitrate;
+                    playerData.maxStreamingBitrate = supportsAdaptiveBitrate ? manifestMaxBitrate : maxBitrate;
                     playerData.streamInfo = streamInfo;
+
+                    const subtitleSummary = (mediaSource.MediaStreams || [])
+                        .filter(stream => stream.Type === 'Subtitle')
+                        .map(stream => `${stream.Index}/${stream.Codec}/${stream.DeliveryMethod || 'none'}/${isClientRenderedPgsSubtitle(stream) ? 'pgs-client' : 'server'}`)
+                        .join(', ');
+                    console.warn(`[PGS] playback mediaSource subtitle state: playOption=${subtitleStreamIndex ?? 'none'} clientHeld=${clientRenderedSubtitleStreamIndex ?? 'none'} default=${mediaSource.DefaultSubtitleStreamIndex ?? 'none'} request=${options.subtitleStreamIndex ?? 'none'} burn=${appSettings.get('subtitleburnin') || 'none'} render=${appSettings.get('subtitlerenderpgs') || 'false'} subtitles=[${subtitleSummary}]`);
 
                     return player.play(streamInfo).then(function () {
                         loading.hide();

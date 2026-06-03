@@ -119,6 +119,19 @@ function enableNativeTrackSupport(mediaSource, track) {
     return true;
 }
 
+function isPgsTrack(track) {
+    return (track?.Codec || '').toLowerCase() === 'pgssub';
+}
+
+function isClientRenderedPgsTrack(track) {
+    const subtitleBurninSetting = appSettings.get('subtitleburnin');
+    return isPgsTrack(track)
+        && appSettings.get('subtitlerenderpgs') === 'true'
+        && subtitleBurninSetting !== 'all'
+        && subtitleBurninSetting !== 'allcomplexformats'
+        && subtitleBurninSetting !== 'onlyimageformats';
+}
+
 function requireHlsPlayer(callback) {
     import('hls.js/dist/hls.js').then(({ default: hls }) => {
         hls.DefaultConfig.lowLatencyMode = false;
@@ -187,9 +200,17 @@ function getManualHlsLevelForBitrate(levels, maxBitrate) {
 }
 
 const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
-const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 30;
-const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 512 * 1024 * 1024;
+const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 60;
+const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
+const CUSTOM_AUTO_INITIAL_BITRATE = 20000000;
+const CUSTOM_AUTO_TICK_MS = 5000;
+const CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS = 45000;
+const CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS = 15000;
+const CUSTOM_AUTO_UP_BANDWIDTH_FACTOR = 0.75;
+const CUSTOM_AUTO_DOWN_BANDWIDTH_FACTOR = 0.95;
+const CUSTOM_AUTO_BANDWIDTH_EWMA_ALPHA = 0.3;
+const CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES = 2;
 
 function getHlsAbrOptions(options) {
     if (!options.adaptiveBitrateStreaming) {
@@ -225,9 +246,11 @@ function getHlsAbrOptions(options) {
 function getHlsBufferOptions(player, options) {
     const savedBufferLength = userSettings.hlsForwardBufferLength();
     if (savedBufferLength > 0) {
+        const bufferLength = options.adaptiveBitrateStreaming ? Math.max(savedBufferLength, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH) : savedBufferLength;
+
         return {
-            maxBufferLength: savedBufferLength,
-            maxMaxBufferLength: savedBufferLength,
+            maxBufferLength: bufferLength,
+            maxMaxBufferLength: bufferLength,
             ...(options.adaptiveBitrateStreaming ? { maxBufferSize: CUSTOM_ABR_HLS_MAX_BUFFER_SIZE } : {}),
             backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
             liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
@@ -259,6 +282,127 @@ function getHlsBufferOptions(player, options) {
         maxBufferLength: 30,
         maxMaxBufferLength: 30
     };
+}
+
+function useCustomHlsAutoBitrate(options) {
+    return options.adaptiveBitrateStreaming && (browser.iOS || browser.safari);
+}
+
+function getBufferedAhead(mediaElement) {
+    if (!mediaElement) {
+        return 0;
+    }
+
+    const currentTime = mediaElement.currentTime || 0;
+    const buffered = mediaElement.buffered;
+
+    for (let i = 0, length = buffered.length; i < length; i++) {
+        if (buffered.start(i) <= currentTime && buffered.end(i) >= currentTime) {
+            return buffered.end(i) - currentTime;
+        }
+    }
+
+    return 0;
+}
+
+function getHlsBufferedAhead(hls, mediaElement) {
+    const hlsBufferLength = hls?.mainForwardBufferInfo?.len;
+    if (Number.isFinite(hlsBufferLength)) {
+        return hlsBufferLength;
+    }
+
+    return getBufferedAhead(mediaElement);
+}
+
+function getHlsLevelTargetDuration(hls, levelIndex) {
+    const details = hls?.levels?.[levelIndex]?.details;
+    const targetDuration = details?.targetduration || details?.fragments?.[0]?.duration;
+
+    return Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : 3;
+}
+
+function getCustomAutoLevelForBandwidth(levels, bandwidth, factor) {
+    if (!Number.isFinite(bandwidth) || bandwidth <= 0) {
+        return -1;
+    }
+
+    const budget = bandwidth * factor;
+    let selectedLevel = -1;
+
+    for (let i = 0, length = levels.length; i < length; i++) {
+        const bitrate = getHlsLevelBitrate(levels[i]);
+        if (bitrate > 0 && bitrate <= budget) {
+            selectedLevel = i;
+        }
+    }
+
+    return selectedLevel === -1 ? 0 : selectedLevel;
+}
+
+function getCustomAutoSegmentBandwidth(data) {
+    const stats = data?.frag?.stats || data?.part?.stats;
+    const loaded = stats?.loaded || stats?.total || data?.payload?.byteLength || 0;
+    const loading = stats?.loading || {};
+    const start = loading.first || loading.start || 0;
+    const end = loading.end || 0;
+    const elapsedMs = end - start;
+
+    if (loaded > 0 && elapsedMs > 0) {
+        return (loaded * 8000) / elapsedMs;
+    }
+
+    const bandwidthEstimate = stats?.bwEstimate;
+    return Number.isFinite(bandwidthEstimate) && bandwidthEstimate > 0 ? bandwidthEstimate : 0;
+}
+
+function resetCustomAutoHlsBufferLimit(hls) {
+    if (!hls?.config) {
+        return;
+    }
+
+    hls.config.maxBufferLength = Math.max(hls.config.maxBufferLength || 0, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH);
+    hls.config.maxMaxBufferLength = Math.max(hls.config.maxMaxBufferLength || 0, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH);
+    hls.config.maxBufferSize = Math.max(hls.config.maxBufferSize || 0, CUSTOM_ABR_HLS_MAX_BUFFER_SIZE);
+}
+
+function getInitialCustomAutoLevel(hls) {
+    const manualLevel = hls.manualLevel;
+    if (manualLevel > -1) {
+        return manualLevel;
+    }
+
+    const currentLevel = hls.currentLevel;
+    if (currentLevel > -1) {
+        return currentLevel;
+    }
+
+    const loadLevel = hls.loadLevel;
+    if (loadLevel > -1) {
+        return loadLevel;
+    }
+
+    return getManualHlsLevelForBitrate(hls.levels, CUSTOM_AUTO_INITIAL_BITRATE);
+}
+
+function getHlsFragmentRuntimeOffset(frag) {
+    const url = frag?.url || frag?.relurl;
+    const start = frag?.start;
+
+    if (!url || !Number.isFinite(start)) {
+        return null;
+    }
+
+    try {
+        const runtimeTicks = new URL(url, window.location.href).searchParams.get('runtimeTicks');
+        if (runtimeTicks == null) {
+            return null;
+        }
+
+        const runtimeSeconds = Number(runtimeTicks) / 10000000;
+        return Number.isFinite(runtimeSeconds) ? runtimeSeconds - start : null;
+    } catch {
+        return null;
+    }
 }
 
 function getMediaStreamVideoTracks(mediaSource) {
@@ -312,12 +456,21 @@ function getTextTrackUrl(track, item, format) {
     return url;
 }
 
+function getPgsTrackUrl(track, item, mediaSource, startPositionTicks) {
+    const apiClient = ServerConnections.getApiClient(item.ServerId);
+    return apiClient.getUrl(`Videos/${item.Id}/${mediaSource.Id}/Subtitles/${track.Index}/${startPositionTicks || 0}/Stream.pgssub`, {
+        ApiKey: apiClient.accessToken(),
+        CacheBust: Date.now()
+    });
+}
+
 function getDefaultProfile() {
     return profileBuilder({});
 }
 
 const PRIMARY_TEXT_TRACK_INDEX = 0;
 const SECONDARY_TEXT_TRACK_INDEX = 1;
+const PGS_CANVAS_CLASS = 'pgsSubtitlesCanvas';
 
 export class HtmlVideoPlayer {
     /**
@@ -443,6 +596,50 @@ export class HtmlVideoPlayer {
      */
     _hlsPlayer;
     /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateTimer;
+    /**
+     * @type {boolean | undefined}
+     */
+    _customAutoBitrateEnabled;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitratePeakBuffer;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateLastBuffer;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateLastCheckTime;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateLastSwitchTime;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateLastTrend;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateBandwidthEstimate;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateBandwidthSampleCount;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateDesiredLevel;
+    /**
+     * @type {number | undefined}
+     */
+    _hlsRuntimeTimeOffset;
+    /**
      * @private (used in other files)
      * @type {any | null | undefined}
      */
@@ -467,6 +664,167 @@ export class HtmlVideoPlayer {
 
     currentSrc() {
         return this.#currentSrc;
+    }
+
+    /**
+     * @private
+     */
+    stopCustomAutoBitrate() {
+        this._customAutoBitrateEnabled = false;
+        this._customAutoBitratePeakBuffer = undefined;
+        this._customAutoBitrateLastBuffer = undefined;
+        this._customAutoBitrateLastCheckTime = undefined;
+        this._customAutoBitrateLastSwitchTime = undefined;
+        this._customAutoBitrateLastTrend = undefined;
+        this._customAutoBitrateBandwidthEstimate = undefined;
+        this._customAutoBitrateBandwidthSampleCount = undefined;
+        this._customAutoBitrateDesiredLevel = undefined;
+
+        if (this._customAutoBitrateTimer) {
+            clearInterval(this._customAutoBitrateTimer);
+            this._customAutoBitrateTimer = undefined;
+        }
+    }
+
+    /**
+     * @private
+     */
+    getPlaybackRuntimeTimeOffset() {
+        return this._hlsRuntimeTimeOffset ?? ((this._currentPlayOptions?.transcodingOffsetTicks || 0) / 10000000);
+    }
+
+    /**
+     * @private
+     */
+    getPgsSubtitleTimeOffset() {
+        return this.getPlaybackRuntimeTimeOffset() + (this.#currentTrackOffset || 0);
+    }
+
+    /**
+     * @private
+     */
+    updateHlsRuntimeTimeOffset(frag) {
+        const offset = getHlsFragmentRuntimeOffset(frag);
+        if (offset == null) {
+            return;
+        }
+
+        if (this._hlsRuntimeTimeOffset == null || Math.abs(this._hlsRuntimeTimeOffset - offset) > 0.001) {
+            this._hlsRuntimeTimeOffset = offset;
+            if (this.#currentPgsRenderer) {
+                this.#currentPgsRenderer.timeOffset = this.getPgsSubtitleTimeOffset();
+            }
+            console.warn(`[PGS] hls runtime offset: ${offset.toFixed(3)}s`);
+        }
+    }
+
+    /**
+     * @private
+     */
+    startCustomAutoBitrate() {
+        const hls = this._hlsPlayer;
+        if (!hls?.levels?.length || hls.levels.length < 2) {
+            return;
+        }
+
+        this._customAutoBitrateEnabled = true;
+        resetCustomAutoHlsBufferLimit(hls);
+
+        const initialLevel = getInitialCustomAutoLevel(hls);
+        if (initialLevel > -1) {
+            hls.loadLevel = initialLevel;
+        }
+
+        const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
+        this._customAutoBitratePeakBuffer = bufferedAhead;
+        this._customAutoBitrateLastBuffer = bufferedAhead;
+        this._customAutoBitrateLastCheckTime = performance.now();
+        this._customAutoBitrateLastSwitchTime = performance.now();
+        this._customAutoBitrateDesiredLevel = initialLevel;
+
+        if (!this._customAutoBitrateTimer) {
+            this._customAutoBitrateTimer = setInterval(() => {
+                this.updateCustomAutoBitrate();
+            }, CUSTOM_AUTO_TICK_MS);
+        }
+
+        this.updateCustomAutoBitrate();
+    }
+
+    /**
+     * @private
+     */
+    recordCustomAutoBitrateSample(data) {
+        if (!this._customAutoBitrateEnabled) {
+            return;
+        }
+
+        const bandwidth = getCustomAutoSegmentBandwidth(data);
+        if (!Number.isFinite(bandwidth) || bandwidth <= 0) {
+            return;
+        }
+
+        const currentEstimate = this._customAutoBitrateBandwidthEstimate;
+        this._customAutoBitrateBandwidthEstimate = currentEstimate > 0
+            ? (currentEstimate * (1 - CUSTOM_AUTO_BANDWIDTH_EWMA_ALPHA)) + (bandwidth * CUSTOM_AUTO_BANDWIDTH_EWMA_ALPHA)
+            : bandwidth;
+        this._customAutoBitrateBandwidthSampleCount = (this._customAutoBitrateBandwidthSampleCount || 0) + 1;
+
+        this.updateCustomAutoBitrate();
+    }
+
+    /**
+     * @private
+     */
+    updateCustomAutoBitrate() {
+        const hls = this._hlsPlayer;
+        const elem = this.#mediaElement;
+        if (!this._customAutoBitrateEnabled || !hls?.levels?.length || hls.levels.length < 2 || !elem) {
+            return;
+        }
+
+        const currentLevel = Math.max(hls.loadLevel, hls.currentLevel, 0);
+        const bufferedAhead = getHlsBufferedAhead(hls, elem);
+        const now = performance.now();
+        const lastCheckTime = this._customAutoBitrateLastCheckTime || now;
+        const secondsSinceLastCheck = Math.max((now - lastCheckTime) / 1000, 0.001);
+        const lastBuffer = this._customAutoBitrateLastBuffer ?? bufferedAhead;
+        const bufferTrend = (bufferedAhead - lastBuffer) / secondsSinceLastCheck;
+        const segmentDuration = getHlsLevelTargetDuration(hls, currentLevel);
+        const peakBuffer = Math.max(this._customAutoBitratePeakBuffer || 0, bufferedAhead, segmentDuration * 2);
+        const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
+        const bandwidthEstimate = this._customAutoBitrateBandwidthEstimate || hls.bandwidthEstimate || 0;
+        const bandwidthSampleCount = this._customAutoBitrateBandwidthSampleCount || 0;
+        const upLevel = getCustomAutoLevelForBandwidth(hls.levels, bandwidthEstimate, CUSTOM_AUTO_UP_BANDWIDTH_FACTOR);
+        const downLevel = getCustomAutoLevelForBandwidth(hls.levels, bandwidthEstimate, CUSTOM_AUTO_DOWN_BANDWIDTH_FACTOR);
+
+        this._customAutoBitratePeakBuffer = peakBuffer;
+        this._customAutoBitrateLastBuffer = bufferedAhead;
+        this._customAutoBitrateLastCheckTime = now;
+        this._customAutoBitrateLastTrend = bufferTrend;
+        this._customAutoBitrateDesiredLevel = upLevel;
+
+        if (currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
+            if (bandwidthSampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES && downLevel > -1 && downLevel < currentLevel) {
+                this._customAutoBitratePeakBuffer = bufferedAhead;
+                this._customAutoBitrateLastSwitchTime = now;
+                resetCustomAutoHlsBufferLimit(hls);
+                hls.loadLevel = downLevel;
+                console.debug(`custom hls auto down: level=${downLevel} buffer=${bufferedAhead.toFixed(1)}s trend=${bufferTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)}`);
+                return;
+            }
+        }
+
+        if (bandwidthSampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES
+            && upLevel > currentLevel
+            && switchAge >= CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS
+            && currentLevel < hls.levels.length - 1) {
+            this._customAutoBitratePeakBuffer = bufferedAhead;
+            this._customAutoBitrateLastSwitchTime = now;
+            resetCustomAutoHlsBufferLimit(hls);
+            hls.loadLevel = currentLevel + 1;
+            console.debug(`custom hls auto up: level=${currentLevel + 1} target=${upLevel} buffer=${bufferedAhead.toFixed(1)}s trend=${bufferTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)}`);
+        }
     }
 
     /**
@@ -599,9 +957,26 @@ export class HtmlVideoPlayer {
                     if (options.initialMaxStreamingBitrate) {
                         const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
                         if (level !== -1) {
+                            resetCustomAutoHlsBufferLimit(hls);
                             hls.loadLevel = level;
                         }
+                    } else if (useCustomHlsAutoBitrate(options)) {
+                        this.startCustomAutoBitrate();
                     }
+                });
+
+                hls.on(Hls.Events.FRAG_BUFFERED, () => {
+                    this.updateCustomAutoBitrate();
+                });
+                hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+                    this.recordCustomAutoBitrateSample(data);
+                });
+                hls.on(Hls.Events.FRAG_CHANGED, (event, data) => {
+                    this.updateHlsRuntimeTimeOffset(data.frag);
+                });
+                hls.on(Hls.Events.LEVEL_SWITCHED, () => {
+                    resetCustomAutoHlsBufferLimit(hls);
+                    this.updateCustomAutoBitrate();
                 });
 
                 bindEventsToHlsPlayer(this, hls, elem, this.onError, resolve, reject);
@@ -629,6 +1004,8 @@ export class HtmlVideoPlayer {
             val += `#t=${seconds}`;
         }
 
+        this.stopCustomAutoBitrate();
+        this._hlsRuntimeTimeOffset = undefined;
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
         destroyCastPlayer(this);
@@ -637,8 +1014,9 @@ export class HtmlVideoPlayer {
 
         this.#subtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSubtitleStreamIndex;
         if (this.#subtitleTrackIndexToSetOnPlaying != null && this.#subtitleTrackIndexToSetOnPlaying >= 0) {
-            const initialSubtitleStream = options.mediaSource.MediaStreams[this.#subtitleTrackIndexToSetOnPlaying];
-            if (!initialSubtitleStream || initialSubtitleStream.DeliveryMethod === 'Encode') {
+            const initialSubtitleStream = options.mediaSource.MediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === this.#subtitleTrackIndexToSetOnPlaying);
+            console.warn(`[PGS] initial subtitle track: index=${this.#subtitleTrackIndexToSetOnPlaying} stream=${initialSubtitleStream ? `${initialSubtitleStream.Index}/${initialSubtitleStream.Codec}/${initialSubtitleStream.DeliveryMethod || 'none'}` : 'none'} pgsClient=${isClientRenderedPgsTrack(initialSubtitleStream)}`);
+            if (!initialSubtitleStream || (initialSubtitleStream.DeliveryMethod === 'Encode' && !isClientRenderedPgsTrack(initialSubtitleStream))) {
                 this.#subtitleTrackIndexToSetOnPlaying = -1;
                 secondaryTrackValid = false;
             }
@@ -657,7 +1035,7 @@ export class HtmlVideoPlayer {
         if (secondaryTrackValid) {
             this.#secondarySubtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSecondarySubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSecondarySubtitleStreamIndex;
             if (this.#secondarySubtitleTrackIndexToSetOnPlaying != null && this.#secondarySubtitleTrackIndexToSetOnPlaying >= 0) {
-                const initialSecondarySubtitleStream = options.mediaSource.MediaStreams[this.#secondarySubtitleTrackIndexToSetOnPlaying];
+                const initialSecondarySubtitleStream = options.mediaSource.MediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === this.#secondarySubtitleTrackIndexToSetOnPlaying);
                 if (!initialSecondarySubtitleStream || !playbackManager.trackHasSecondarySubtitleSupport(initialSecondarySubtitleStream, this)) {
                     this.#secondarySubtitleTrackIndexToSetOnPlaying = -1;
                 }
@@ -748,7 +1126,7 @@ export class HtmlVideoPlayer {
             this.#currentAssRenderer.timeOffset = (this._currentPlayOptions.transcodingOffsetTicks || 0) / 10000000 + offsetValue;
         } else if (this.#currentPgsRenderer) {
             this.updateCurrentTrackOffset(offsetValue);
-            this.#currentPgsRenderer.timeOffset = (this._currentPlayOptions.transcodingOffsetTicks || 0) / 10000000 + offsetValue;
+            this.#currentPgsRenderer.timeOffset = this.getPgsSubtitleTimeOffset();
         } else {
             const trackElements = this.getTextTracks();
             // if .vtt currently rendering
@@ -989,6 +1367,7 @@ export class HtmlVideoPlayer {
     destroy() {
         this.setSubtitleOffset.cancel();
 
+        this.stopCustomAutoBitrate();
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
 
@@ -1067,7 +1446,7 @@ export class HtmlVideoPlayer {
         // Not sure yet how this is coming up null since we never null it out, but it is causing app crashes
         if (currentPlayOptions) {
             let timeMs = time * 1000;
-            timeMs += ((currentPlayOptions.transcodingOffsetTicks || 0) / 10000);
+            timeMs += this.getPlaybackRuntimeTimeOffset() * 1000;
             this.updateSubtitleText(timeMs);
         }
 
@@ -1204,6 +1583,23 @@ export class HtmlVideoPlayer {
     };
 
     onWaiting = () => {
+        if (this._customAutoBitrateEnabled) {
+            const hls = this._hlsPlayer;
+            const currentLevel = hls ? Math.max(hls.loadLevel, hls.currentLevel, 0) : -1;
+            const now = performance.now();
+            const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
+
+            if (hls && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
+                const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
+                this._customAutoBitratePeakBuffer = bufferedAhead;
+                this._customAutoBitrateLastBuffer = bufferedAhead;
+                this._customAutoBitrateLastCheckTime = now;
+                this._customAutoBitrateLastSwitchTime = now;
+                resetCustomAutoHlsBufferLimit(hls);
+                hls.loadLevel = currentLevel - 1;
+            }
+        }
+
         Events.trigger(this, 'waiting');
     };
 
@@ -1262,6 +1658,7 @@ export class HtmlVideoPlayer {
                 tryRemoveElement(this.#videoSubtitlesElem);
                 this.#videoSubtitlesElem = null;
             }
+            document.querySelectorAll(`.${PGS_CANVAS_CLASS}`).forEach(tryRemoveElement);
         } else if (this.isSecondaryTrack(targetTrackIndex)) {
             if (this.#videoSecondarySubtitlesElem) {
                 tryRemoveElement(this.#videoSecondarySubtitlesElem);
@@ -1275,6 +1672,9 @@ export class HtmlVideoPlayer {
             }
             this.#videoSubtitlesElem = null;
             this.#videoSecondarySubtitlesElem = null;
+            document.querySelectorAll(`.${PGS_CANVAS_CLASS}`).forEach(tryRemoveElement);
+        } else {
+            document.querySelectorAll(`.${PGS_CANVAS_CLASS}`).forEach(tryRemoveElement);
         }
     }
 
@@ -1495,14 +1895,33 @@ export class HtmlVideoPlayer {
     renderPgs(videoElement, track, item) {
         import('libpgs').then((libpgs) => {
             const aspectRatio = this.getPgsRenderAspectRatio();
+            const canvas = document.createElement('canvas');
+            canvas.classList.add(PGS_CANVAS_CLASS);
+            canvas.style.position = 'absolute';
+            canvas.style.inset = '0';
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
+            canvas.style.zIndex = '1';
+            canvas.style.pointerEvents = 'none';
+            canvas.style.objectFit = aspectRatio;
+            videoElement.parentNode.appendChild(canvas);
             const options = {
                 video: videoElement,
-                subUrl: getTextTrackUrl(track, item),
+                canvas,
+                subUrl: getPgsTrackUrl(track, item, this._currentPlayOptions.mediaSource, this._currentPlayOptions.playerStartPositionTicks),
                 workerUrl: `${appRouter.baseUrl()}/libraries/libpgs.worker.js`,
-                timeOffset: (this._currentPlayOptions.transcodingOffsetTicks || 0) / 10000000,
-                aspectRatio
+                timeOffset: this.getPgsSubtitleTimeOffset(),
+                aspectRatio,
+                mode: 'mainThread'
             };
+            console.warn(`[PGS] rendering PGS subtitles: index=${track.Index} delivery=${track.DeliveryMethod || 'none'} videoTime=${videoElement.currentTime.toFixed(3)} offset=${options.timeOffset.toFixed(3)} url=${options.subUrl}`);
             this.#currentPgsRenderer = new libpgs.PgsRenderer(options);
+            // libpgs initializes its previous timestamp index to 0. If playback starts inside
+            // timestamp index 0, the first real render is skipped unless we force a state change.
+            this.#currentPgsRenderer.renderAtTimestamp(-1);
+            setTimeout(() => {
+                console.warn(`[PGS] canvas state: size=${canvas.width}x${canvas.height} videoTime=${videoElement.currentTime.toFixed(3)} offset=${this.#currentPgsRenderer?.timeOffset?.toFixed?.(3) || 'none'}`);
+            }, 5000);
         });
     }
 
@@ -1595,6 +2014,11 @@ export class HtmlVideoPlayer {
      * @private
      */
     async renderTracksEvents(videoElement, track, item, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
+        if (isClientRenderedPgsTrack(track)) {
+            this.renderPgs(videoElement, track, item);
+            return;
+        }
+
         if (!itemHelper.isLocalItem(item) || track.IsExternal) {
             const format = (track.Codec || '').toLowerCase();
             if (format === 'ssa' || format === 'ass') {
@@ -1710,6 +2134,7 @@ export class HtmlVideoPlayer {
         let track = streamIndex === -1 ? null : mediaStreamTextTracks.filter(function (t) {
             return t.Index === streamIndex;
         })[0];
+        console.warn(`[PGS] text track resolved: index=${streamIndex} track=${track ? `${track.Index}/${track.Codec}/${track.DeliveryMethod || 'none'}` : 'none'} pgsClient=${isClientRenderedPgsTrack(track)}`);
 
         // This play method can only check if it is real direct play, and will mark Remux as Transcode as well
         const isDirectPlay = this._currentPlayOptions.playMethod === 'DirectPlay';
@@ -1891,6 +2316,10 @@ export class HtmlVideoPlayer {
     }
 
     enableAutomaticBitrateDetection() {
+        if (this._customAutoBitrateEnabled) {
+            return true;
+        }
+
         const hls = this._hlsPlayer;
         if (!hls?.levels?.length || hls.levels.length < 2) {
             return null;
@@ -1917,9 +2346,19 @@ export class HtmlVideoPlayer {
         }
 
         if (options.enableAutomaticBitrateDetection || !options.maxBitrate) {
-            hls.loadLevel = -1;
+            resetCustomAutoHlsBufferLimit(hls);
+
+            if (useCustomHlsAutoBitrate(this._currentPlayOptions || {})) {
+                this.startCustomAutoBitrate();
+            } else {
+                this.stopCustomAutoBitrate();
+                hls.loadLevel = -1;
+            }
             return true;
         }
+
+        this.stopCustomAutoBitrate();
+        resetCustomAutoHlsBufferLimit(hls);
 
         const level = getManualHlsLevelForBitrate(hls.levels, options.maxBitrate);
         if (level === -1) {
@@ -2010,7 +2449,7 @@ export class HtmlVideoPlayer {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {
             if (val != null) {
-                const time = val / 1000;
+                const time = Math.max(0, (val / 1000) - this.getPlaybackRuntimeTimeOffset());
                 mediaElement.currentTime = time;
                 this.#currentTime = time;
                 Events.trigger(this, 'timeupdate', [{ isPositionChange: true }]);
@@ -2019,10 +2458,10 @@ export class HtmlVideoPlayer {
 
             const currentTime = this.#currentTime;
             if (currentTime != null) {
-                return currentTime * 1000;
+                return (currentTime + this.getPlaybackRuntimeTimeOffset()) * 1000;
             }
 
-            return (mediaElement.currentTime || 0) * 1000;
+            return ((mediaElement.currentTime || 0) + this.getPlaybackRuntimeTimeOffset()) * 1000;
         }
     }
 
@@ -2373,6 +2812,21 @@ export class HtmlVideoPlayer {
             mediaCategory.stats.push({
                 label: globalize.translate('LabelStreamType'),
                 value: mediaInfos.join('  ')
+            });
+        }
+
+        if (this._hlsPlayer?.levels?.length) {
+            const hls = this._hlsPlayer;
+            const level = Math.max(hls.loadLevel, hls.currentLevel, hls.nextAutoLevel, 0);
+            const bitrate = getHlsLevelBitrate(hls.levels[level]);
+            const buffer = getHlsBufferedAhead(hls, mediaElement);
+            const autoDetails = this._customAutoBitrateEnabled
+                ? ` / bwe ${Math.round((this._customAutoBitrateBandwidthEstimate || 0) / 100000) / 10} Mbps / target ${this._customAutoBitrateDesiredLevel ?? '?'} / cap ${Math.round(hls.config?.maxMaxBufferLength || 0)}s / samples ${this._customAutoBitrateBandwidthSampleCount || 0} / trend ${Math.round((this._customAutoBitrateLastTrend || 0) * 10) / 10}s/s`
+                : '';
+
+            mediaCategory.stats.push({
+                label: 'HLS Auto',
+                value: `${this._customAutoBitrateEnabled ? 'Custom' : hls.autoLevelEnabled ? 'hls.js' : 'Manual'} / ${level} / ${bitrate ? `${Math.round(bitrate / 100000) / 10} Mbps` : 'unknown'} / ${Math.round(buffer)}s${autoDetails}`
             });
         }
 
