@@ -203,7 +203,7 @@ const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
 const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 60;
 const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
-const CUSTOM_AUTO_INITIAL_BITRATE = 20000000;
+const CUSTOM_AUTO_INITIAL_BITRATE = 6000000;
 const CUSTOM_AUTO_TICK_MS = 5000;
 const CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS = 45000;
 const CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS = 15000;
@@ -285,7 +285,7 @@ function getHlsBufferOptions(player, options) {
 }
 
 function useCustomHlsAutoBitrate(options) {
-    return options.adaptiveBitrateStreaming && (browser.iOS || browser.safari);
+    return options.adaptiveBitrateStreaming;
 }
 
 function getBufferedAhead(mediaElement) {
