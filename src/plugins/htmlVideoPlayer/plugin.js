@@ -216,9 +216,12 @@ const CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS = 45000;
 const CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS = 15000;
 const CUSTOM_AUTO_FULL_BUFFER_UP_SWITCH_INTERVAL_MS = 90000;
 const CUSTOM_AUTO_FULL_BUFFER_RATIO = 0.9;
+const CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS = 90000;
+const CUSTOM_AUTO_PRESSURE_BUFFER_RATIO = 0.4;
+const CUSTOM_AUTO_PRESSURE_NEGATIVE_TREND = -1;
 const CUSTOM_AUTO_UP_BANDWIDTH_FACTOR = 0.75;
 const CUSTOM_AUTO_DOWN_BANDWIDTH_FACTOR = 0.95;
-const CUSTOM_AUTO_BANDWIDTH_WINDOW_MS = 90000;
+const CUSTOM_AUTO_BANDWIDTH_WINDOW_MS = 30000;
 const CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES = 3;
 const CUSTOM_AUTO_MIN_SAMPLE_BYTES = 32 * 1024;
 const CUSTOM_AUTO_RECENT_DOWN_SAMPLE_COUNT = 3;
@@ -404,8 +407,9 @@ function getCustomAutoPercentile(values, percentile) {
     return values[index];
 }
 
-function getCustomAutoBandwidthWindowStats(samples, now) {
-    const windowSamples = pruneCustomAutoBandwidthSamples(samples, now);
+function getCustomAutoBandwidthWindowStats(samples, now, levelFilter = null, minSampleTime = 0) {
+    const windowSamples = pruneCustomAutoBandwidthSamples(samples, now)
+        .filter(sample => (levelFilter == null || sample.level === levelFilter) && sample.time >= minSampleTime);
     const bandwidths = windowSamples
         .map(sample => sample.bandwidth)
         .filter(bandwidth => Number.isFinite(bandwidth) && bandwidth > 0)
@@ -702,6 +706,14 @@ export class HtmlVideoPlayer {
      */
     _customAutoBitrateLastSwitchTime;
     /**
+     * @type {'up' | 'down' | undefined}
+     */
+    _customAutoBitrateLastSwitchDirection;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoBitrateLastSwitchLevel;
+    /**
      * @type {number | undefined}
      */
     _customAutoBitrateLastTrend;
@@ -714,7 +726,7 @@ export class HtmlVideoPlayer {
      */
     _customAutoBitrateBandwidthSampleCount;
     /**
-     * @type {{ time: number, bandwidth: number, elapsedMs: number, loaded: number }[] | undefined}
+     * @type {{ time: number, bandwidth: number, elapsedMs: number, loaded: number, level?: number }[] | undefined}
      */
     _customAutoBitrateBandwidthSamples;
     /**
@@ -769,6 +781,8 @@ export class HtmlVideoPlayer {
         this._customAutoBitrateLastBuffer = undefined;
         this._customAutoBitrateLastCheckTime = undefined;
         this._customAutoBitrateLastSwitchTime = undefined;
+        this._customAutoBitrateLastSwitchDirection = undefined;
+        this._customAutoBitrateLastSwitchLevel = undefined;
         this._customAutoBitrateLastTrend = undefined;
         this._customAutoBitrateBandwidthEstimate = undefined;
         this._customAutoBitrateBandwidthSampleCount = undefined;
@@ -837,6 +851,8 @@ export class HtmlVideoPlayer {
         this._customAutoBitrateLastBuffer = bufferedAhead;
         this._customAutoBitrateLastCheckTime = performance.now();
         this._customAutoBitrateLastSwitchTime = performance.now();
+        this._customAutoBitrateLastSwitchDirection = undefined;
+        this._customAutoBitrateLastSwitchLevel = initialLevel;
         this._customAutoBitrateDesiredLevel = initialLevel;
         this._customAutoBitrateDownLevel = initialLevel;
         this._customAutoBitrateControlledLevel = initialLevel;
@@ -874,7 +890,8 @@ export class HtmlVideoPlayer {
             time: now,
             bandwidth: sample.bandwidth,
             elapsedMs: sample.elapsedMs,
-            loaded: sample.loaded
+            loaded: sample.loaded,
+            level: data?.frag?.level
         });
         this._customAutoBitrateBandwidthSamples = samples;
 
@@ -907,7 +924,17 @@ export class HtmlVideoPlayer {
         const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
         const bufferCap = getHlsForwardBufferCap(hls);
         const hasFullBuffer = bufferCap > 0 && bufferedAhead >= bufferCap * CUSTOM_AUTO_FULL_BUFFER_RATIO;
+        const hasBufferPressure = (bufferCap > 0 && bufferedAhead <= bufferCap * CUSTOM_AUTO_PRESSURE_BUFFER_RATIO)
+            || bufferTrend <= CUSTOM_AUTO_PRESSURE_NEGATIVE_TREND;
+        const isPostUpGrace = this._customAutoBitrateLastSwitchDirection === 'up'
+            && switchAge < CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS;
         const bandwidthStats = getCustomAutoBandwidthWindowStats(this._customAutoBitrateBandwidthSamples || [], now);
+        const currentLevelBandwidthStats = getCustomAutoBandwidthWindowStats(
+            this._customAutoBitrateBandwidthSamples || [],
+            now,
+            currentLevel,
+            this._customAutoBitrateLastSwitchTime || 0
+        );
         this._customAutoBitrateBandwidthSamples = bandwidthStats.samples;
         this._customAutoBitrateBandwidthEstimate = bandwidthStats.displayBandwidth || hls.bandwidthEstimate || 0;
         this._customAutoBitrateBandwidthSampleCount = bandwidthStats.sampleCount;
@@ -915,7 +942,9 @@ export class HtmlVideoPlayer {
         const bandwidthEstimate = this._customAutoBitrateBandwidthEstimate || 0;
         const bandwidthSampleCount = bandwidthStats.sampleCount;
         const upLevel = getCustomAutoLevelForBandwidth(hls.levels, bandwidthStats.upBandwidth, CUSTOM_AUTO_UP_BANDWIDTH_FACTOR);
-        const downLevel = getCustomAutoLevelForBandwidth(hls.levels, bandwidthStats.downBandwidth, CUSTOM_AUTO_DOWN_BANDWIDTH_FACTOR);
+        const downLevel = currentLevelBandwidthStats.sampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES
+            ? getCustomAutoLevelForBandwidth(hls.levels, currentLevelBandwidthStats.downBandwidth, CUSTOM_AUTO_DOWN_BANDWIDTH_FACTOR)
+            : -1;
 
         this._customAutoBitratePeakBuffer = peakBuffer;
         this._customAutoBitrateLastBuffer = bufferedAhead;
@@ -930,6 +959,8 @@ export class HtmlVideoPlayer {
             const nextLevel = currentLevel + 1;
             this._customAutoBitratePeakBuffer = bufferedAhead;
             this._customAutoBitrateLastSwitchTime = now;
+            this._customAutoBitrateLastSwitchDirection = 'up';
+            this._customAutoBitrateLastSwitchLevel = nextLevel;
             this._customAutoBitrateControlledLevel = nextLevel;
             resetCustomAutoHlsBufferLimit(hls);
             hls.loadLevel = nextLevel;
@@ -938,13 +969,19 @@ export class HtmlVideoPlayer {
         }
 
         if (currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
-            if (bandwidthSampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES && downLevel > -1 && downLevel < currentLevel) {
+            if ((!isPostUpGrace || hasBufferPressure)
+                && bandwidthSampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES
+                && currentLevelBandwidthStats.sampleCount >= CUSTOM_AUTO_MIN_BANDWIDTH_SAMPLES
+                && downLevel > -1
+                && downLevel < currentLevel) {
                 this._customAutoBitratePeakBuffer = bufferedAhead;
                 this._customAutoBitrateLastSwitchTime = now;
+                this._customAutoBitrateLastSwitchDirection = 'down';
+                this._customAutoBitrateLastSwitchLevel = downLevel;
                 this._customAutoBitrateControlledLevel = downLevel;
                 resetCustomAutoHlsBufferLimit(hls);
                 hls.loadLevel = downLevel;
-                console.debug(`custom hls auto down: level=${downLevel} buffer=${bufferedAhead.toFixed(1)}s trend=${bufferTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)} downBwe=${Math.round(bandwidthStats.downBandwidth)}`);
+                console.debug(`custom hls auto down: level=${downLevel} buffer=${bufferedAhead.toFixed(1)}s trend=${bufferTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)} downBwe=${Math.round(currentLevelBandwidthStats.downBandwidth)} levelSamples=${currentLevelBandwidthStats.sampleCount}`);
                 return;
             }
         }
@@ -955,6 +992,8 @@ export class HtmlVideoPlayer {
             && currentLevel < hls.levels.length - 1) {
             this._customAutoBitratePeakBuffer = bufferedAhead;
             this._customAutoBitrateLastSwitchTime = now;
+            this._customAutoBitrateLastSwitchDirection = 'up';
+            this._customAutoBitrateLastSwitchLevel = currentLevel + 1;
             this._customAutoBitrateControlledLevel = currentLevel + 1;
             resetCustomAutoHlsBufferLimit(hls);
             hls.loadLevel = currentLevel + 1;
@@ -1730,6 +1769,8 @@ export class HtmlVideoPlayer {
                 this._customAutoBitrateLastBuffer = bufferedAhead;
                 this._customAutoBitrateLastCheckTime = now;
                 this._customAutoBitrateLastSwitchTime = now;
+                this._customAutoBitrateLastSwitchDirection = 'down';
+                this._customAutoBitrateLastSwitchLevel = currentLevel - 1;
                 this._customAutoBitrateControlledLevel = currentLevel - 1;
                 resetCustomAutoHlsBufferLimit(hls);
                 hls.loadLevel = currentLevel - 1;
@@ -2958,14 +2999,21 @@ export class HtmlVideoPlayer {
                 : Math.max(hls.loadLevel, hls.currentLevel, hls.nextAutoLevel, 0);
             const bitrate = getHlsLevelBitrate(hls.levels[level]);
             const buffer = getHlsBufferedAhead(hls, mediaElement);
+            const now = performance.now();
             const switchAge = this._customAutoBitrateLastSwitchTime
-                ? Math.round((performance.now() - this._customAutoBitrateLastSwitchTime) / 1000)
+                ? Math.round((now - this._customAutoBitrateLastSwitchTime) / 1000)
                 : 0;
             const bandwidthStats = this._customAutoBitrateEnabled
-                ? getCustomAutoBandwidthWindowStats(this._customAutoBitrateBandwidthSamples || [], performance.now())
+                ? getCustomAutoBandwidthWindowStats(this._customAutoBitrateBandwidthSamples || [], now)
                 : null;
+            const currentLevelBandwidthStats = this._customAutoBitrateEnabled
+                ? getCustomAutoBandwidthWindowStats(this._customAutoBitrateBandwidthSamples || [], now, level, this._customAutoBitrateLastSwitchTime || 0)
+                : null;
+            const graceSeconds = this._customAutoBitrateLastSwitchDirection === 'up'
+                ? Math.max(0, Math.ceil((CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS - (now - (this._customAutoBitrateLastSwitchTime || 0))) / 1000))
+                : 0;
             const autoDetails = this._customAutoBitrateEnabled
-                ? ` / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / bwe ${Math.round((this._customAutoBitrateBandwidthEstimate || 0) / 100000) / 10} Mbps / upBwe ${Math.round((bandwidthStats?.upBandwidth || 0) / 100000) / 10} Mbps / downBwe ${Math.round((bandwidthStats?.downBandwidth || 0) / 100000) / 10} Mbps / upTarget ${this._customAutoBitrateDesiredLevel ?? '?'} / downTarget ${this._customAutoBitrateDownLevel ?? '?'} / sw ${switchAge}s / cap ${Math.round(hls.config?.maxMaxBufferLength || 0)}s / samples ${this._customAutoBitrateBandwidthSampleCount || 0} / trend ${Math.round((this._customAutoBitrateLastTrend || 0) * 10) / 10}s/s`
+                ? ` / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / bwe ${Math.round((this._customAutoBitrateBandwidthEstimate || 0) / 100000) / 10} Mbps / upBwe ${Math.round((bandwidthStats?.upBandwidth || 0) / 100000) / 10} Mbps / downBwe ${Math.round((currentLevelBandwidthStats?.downBandwidth || 0) / 100000) / 10} Mbps / upTarget ${this._customAutoBitrateDesiredLevel ?? '?'} / downTarget ${this._customAutoBitrateDownLevel ?? '?'} / sw ${switchAge}s / grace ${graceSeconds}s / cap ${Math.round(hls.config?.maxMaxBufferLength || 0)}s / samples ${this._customAutoBitrateBandwidthSampleCount || 0} / levelSamples ${currentLevelBandwidthStats?.sampleCount || 0} / trend ${Math.round((this._customAutoBitrateLastTrend || 0) * 10) / 10}s/s`
                 : '';
 
             mediaCategory.stats.push({
