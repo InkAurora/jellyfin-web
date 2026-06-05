@@ -37,9 +37,10 @@ import { bindSkipSegment } from './skipsegment.ts';
 const UNLIMITED_ITEMS = -1;
 const VIDEO_QUALITY_BITRATES = [
     120000000,
-    80000000,
-    60000000,
     40000000,
+    35000000,
+    30000000,
+    25000000,
     20000000,
     15000000,
     10000000,

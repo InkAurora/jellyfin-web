@@ -10,9 +10,10 @@ export function getVideoQualityOptions(options) {
     // Question: the maxHeight field seems not be used anywhere, is it safe to remove those?
     const bitrateConfigurations = [
         { name: '120 Mbps', maxHeight: 2160, bitrate: 120000000 },
-        { name: '80 Mbps', maxHeight: 2160, bitrate: 80000000 },
-        { name: '60 Mbps', maxHeight: 2160, bitrate: 60000000 },
         { name: '40 Mbps', maxHeight: 2160, bitrate: 40000000 },
+        { name: '35 Mbps', maxHeight: 2160, bitrate: 35000000 },
+        { name: '30 Mbps', maxHeight: 2160, bitrate: 30000000 },
+        { name: '25 Mbps', maxHeight: 2160, bitrate: 25000000 },
         { name: '20 Mbps', maxHeight: 2160, bitrate: 20000000 },
         { name: '15 Mbps', maxHeight: 1440, bitrate: 15000000 },
         { name: '10 Mbps', maxHeight: 1440, bitrate: 10000000 },
