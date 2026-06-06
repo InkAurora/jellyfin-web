@@ -223,6 +223,7 @@ const CUSTOM_AUTO_BUFFER_CRITICAL_RATIO = 0.18;
 const CUSTOM_AUTO_BUFFER_STABLE_TREND = -0.05;
 const CUSTOM_AUTO_BUFFER_DRAIN_TREND = -0.15;
 const CUSTOM_AUTO_BUFFER_FAST_DRAIN_TREND = -0.75;
+const CUSTOM_AUTO_SEEK_DOWN_GRACE_MS = 15000;
 const CUSTOM_AUTO_BANDWIDTH_WINDOW_MS = 30000;
 const CUSTOM_AUTO_MIN_SAMPLE_BYTES = 32 * 1024;
 const CUSTOM_AUTO_RECENT_DOWN_SAMPLE_COUNT = 3;
@@ -781,6 +782,14 @@ export class HtmlVideoPlayer {
      */
     _customAutoBufferPaused;
     /**
+     * @type {boolean | undefined}
+     */
+    _customAutoBufferSeeking;
+    /**
+     * @type {number | undefined}
+     */
+    _customAutoLastSeekTime;
+    /**
      * @type {number | undefined}
      */
     _customAutoBitrateDesiredLevel;
@@ -844,6 +853,8 @@ export class HtmlVideoPlayer {
         this._customAutoBufferLongTrend = undefined;
         this._customAutoBufferSamples = undefined;
         this._customAutoBufferPaused = undefined;
+        this._customAutoBufferSeeking = undefined;
+        this._customAutoLastSeekTime = undefined;
         this._customAutoBitrateDesiredLevel = undefined;
         this._customAutoBitrateDownLevel = undefined;
         this._customAutoBitrateControlledLevel = undefined;
@@ -916,6 +927,8 @@ export class HtmlVideoPlayer {
         this._customAutoBitrateBandwidthSamples = [];
         this._customAutoBufferSamples = [];
         this._customAutoBufferPaused = false;
+        this._customAutoBufferSeeking = false;
+        this._customAutoLastSeekTime = undefined;
 
         if (!this._customAutoBitrateTimer) {
             this._customAutoBitrateTimer = setInterval(() => {
@@ -976,9 +989,27 @@ export class HtmlVideoPlayer {
         const currentLevel = getCustomAutoControlledLevel(hls, this._customAutoBitrateControlledLevel);
         const bufferedAhead = getHlsBufferedAhead(hls, elem);
         const now = performance.now();
+        let isSeeking = elem.seeking || this._customAutoBufferSeeking;
+        if (this._customAutoBufferSeeking
+            && !elem.seeking
+            && this._customAutoLastSeekTime != null
+            && now - this._customAutoLastSeekTime >= CUSTOM_AUTO_SEEK_DOWN_GRACE_MS) {
+            this._customAutoBufferSeeking = false;
+            isSeeking = false;
+        }
+        const isSeekDownGrace = isSeeking
+            || (this._customAutoLastSeekTime != null && now - this._customAutoLastSeekTime < CUSTOM_AUTO_SEEK_DOWN_GRACE_MS);
 
         if (elem.paused) {
             this._customAutoBufferPaused = true;
+            this._customAutoBitrateLastBuffer = bufferedAhead;
+            this._customAutoBitrateLastCheckTime = now;
+            return;
+        }
+
+        if (isSeeking) {
+            this._customAutoBufferSamples = [];
+            this._customAutoBitratePeakBuffer = bufferedAhead;
             this._customAutoBitrateLastBuffer = bufferedAhead;
             this._customAutoBitrateLastCheckTime = now;
             return;
@@ -1050,7 +1081,7 @@ export class HtmlVideoPlayer {
             return;
         }
 
-        if (currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
+        if (!isSeekDownGrace && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
             if ((!isPostUpGrace || hasBufferPressure) && downLevel < currentLevel) {
                 this._customAutoBitratePeakBuffer = bufferedAhead;
                 this._customAutoBitrateLastSwitchTime = now;
@@ -1627,6 +1658,8 @@ export class HtmlVideoPlayer {
             videoElement.removeEventListener('click', this.onClick);
             videoElement.removeEventListener('dblclick', this.onDblClick);
             videoElement.removeEventListener('waiting', this.onWaiting);
+            videoElement.removeEventListener('seeking', this.onSeeking);
+            videoElement.removeEventListener('seeked', this.onSeeked);
             videoElement.removeEventListener('error', this.onError); // bound in htmlMediaHelper
 
             resetSrc(videoElement);
@@ -1820,14 +1853,56 @@ export class HtmlVideoPlayer {
         Events.trigger(this, 'pause');
     };
 
+    /**
+     * @private
+     */
+    onSeeking = () => {
+        this._customAutoBufferSeeking = true;
+        this._customAutoLastSeekTime = performance.now();
+
+        if (this._customAutoBitrateEnabled) {
+            const hls = this._hlsPlayer;
+            const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
+            this._customAutoBufferSamples = [];
+            this._customAutoBitratePeakBuffer = bufferedAhead;
+            this._customAutoBitrateLastBuffer = bufferedAhead;
+            this._customAutoBitrateLastCheckTime = this._customAutoLastSeekTime;
+        }
+
+        Events.trigger(this, 'seeking');
+    };
+
+    /**
+     * @private
+     */
+    onSeeked = () => {
+        const now = performance.now();
+        this._customAutoBufferSeeking = false;
+        this._customAutoLastSeekTime = now;
+
+        if (this._customAutoBitrateEnabled) {
+            const hls = this._hlsPlayer;
+            const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
+            this._customAutoBufferSamples = [];
+            this._customAutoBitratePeakBuffer = bufferedAhead;
+            this._customAutoBitrateLastBuffer = bufferedAhead;
+            this._customAutoBitrateLastCheckTime = now;
+        }
+
+        Events.trigger(this, 'seeked');
+    };
+
     onWaiting = () => {
         if (this._customAutoBitrateEnabled) {
             const hls = this._hlsPlayer;
             const currentLevel = hls ? getCustomAutoControlledLevel(hls, this._customAutoBitrateControlledLevel) : -1;
             const now = performance.now();
             const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
+            const isSeekDownGrace = this.#mediaElement?.seeking
+                || this._customAutoBufferSeeking
+                || (this._customAutoLastSeekTime != null && now - this._customAutoLastSeekTime < CUSTOM_AUTO_SEEK_DOWN_GRACE_MS);
 
-            if (hls && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
+            if (!isSeekDownGrace && hls && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
                 const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
                 this._customAutoBitratePeakBuffer = bufferedAhead;
                 this._customAutoBitrateLastBuffer = bufferedAhead;
@@ -2476,6 +2551,8 @@ export class HtmlVideoPlayer {
                 videoElement.addEventListener('click', this.onClick);
                 videoElement.addEventListener('dblclick', this.onDblClick);
                 videoElement.addEventListener('waiting', this.onWaiting);
+                videoElement.addEventListener('seeking', this.onSeeking);
+                videoElement.addEventListener('seeked', this.onSeeked);
                 if (options.backdropUrl) {
                     videoElement.poster = options.backdropUrl;
                 }
@@ -2691,6 +2768,9 @@ export class HtmlVideoPlayer {
         if (mediaElement) {
             if (val != null) {
                 const time = Math.max(0, (val / 1000) - this.getPlaybackRuntimeTimeOffset());
+                this._customAutoBufferSeeking = true;
+                this._customAutoLastSeekTime = performance.now();
+                this._customAutoBufferSamples = [];
                 mediaElement.currentTime = time;
                 this.#currentTime = time;
                 Events.trigger(this, 'timeupdate', [{ isPositionChange: true }]);
