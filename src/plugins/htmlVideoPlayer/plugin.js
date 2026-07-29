@@ -45,6 +45,8 @@ import { PluginType } from '../../types/plugin.ts';
 import Events from '../../utils/events.ts';
 import { includesAny } from '../../utils/container.ts';
 import { isHls } from '../../utils/mediaSource.ts';
+import { HlsAbrGovernor } from './hlsAbrGovernor.ts';
+import { getHlsAbrPlatformOptions } from './hlsAbrOptions.ts';
 
 /**
  * Returns resolved URL.
@@ -132,13 +134,12 @@ function isClientRenderedPgsTrack(track) {
         && subtitleBurninSetting !== 'onlyimageformats';
 }
 
-function requireHlsPlayer(callback) {
-    import('hls.js/dist/hls.js').then(({ default: hls }) => {
+function requireHlsPlayer() {
+    return import('hls.js/dist/hls.js').then(({ default: hls }) => {
         hls.DefaultConfig.lowLatencyMode = false;
         hls.DefaultConfig.backBufferLength = Infinity;
         hls.DefaultConfig.liveBackBufferLength = 90;
         window.Hls = hls;
-        callback();
     });
 }
 
@@ -154,11 +155,30 @@ function getCurrentHlsLevelBitrate(hls) {
     return getHlsLevelBitrate(hls.levels[level]) || null;
 }
 
-function getCustomAutoControlledLevel(hls, controlledLevel) {
-    const level = [hls.loadLevel, controlledLevel, hls.currentLevel, hls.firstLevel]
-        .find(levelIndex => levelIndex != null && levelIndex > -1);
+function canApplyHlsAbrProbe(hls, probeLevel, activeLevel) {
+    if (!hls.autoLevelEnabled
+        || !Number.isInteger(probeLevel)
+        || probeLevel < 0
+        || probeLevel > hls.maxAutoLevel) {
+        return false;
+    }
 
-    return Math.max(level || 0, 0);
+    const currentLevel = [activeLevel, hls.currentLevel, hls.firstLevel, 0]
+        .find(level => Number.isInteger(level) && level >= 0);
+    const current = hls.levels[currentLevel];
+    const target = hls.levels[probeLevel];
+    if (!target || probeLevel <= currentLevel || target.loadError > 0 || target.fragmentError > 0) {
+        return false;
+    }
+
+    if ((current?.codecSet && target.codecSet && current.codecSet !== target.codecSet)
+        || (current?.videoRange && target.videoRange && current.videoRange !== target.videoRange)
+        || (current?.frameRate > 0 && target.frameRate > 0 && current.frameRate > target.frameRate)
+        || target.supportedResult?.decodingInfoResults?.some(result => result.supported === false || result.smooth === false)) {
+        return false;
+    }
+
+    return true;
 }
 
 function getManualHlsLevelForBitrate(levels, maxBitrate) {
@@ -211,25 +231,8 @@ const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 60;
 const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
 const CUSTOM_AUTO_INITIAL_BITRATE = 6000000;
-const CUSTOM_AUTO_TICK_MS = 5000;
-const CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS = 45000;
-const CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS = 15000;
-const CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS = 90000;
-const CUSTOM_AUTO_BUFFER_WINDOW_MS = 60000;
-const CUSTOM_AUTO_BUFFER_SHORT_WINDOW_MS = 15000;
-const CUSTOM_AUTO_BUFFER_FULL_RATIO = 0.85;
-const CUSTOM_AUTO_BUFFER_LOW_RATIO = 0.35;
-const CUSTOM_AUTO_BUFFER_CRITICAL_RATIO = 0.18;
-const CUSTOM_AUTO_BUFFER_STABLE_TREND = -0.05;
-const CUSTOM_AUTO_BUFFER_DRAIN_TREND = -0.15;
-const CUSTOM_AUTO_BUFFER_FAST_DRAIN_TREND = -0.75;
-const CUSTOM_AUTO_SEEK_DOWN_GRACE_MS = 15000;
-const CUSTOM_AUTO_BANDWIDTH_WINDOW_MS = 30000;
-const CUSTOM_AUTO_MIN_SAMPLE_BYTES = 32 * 1024;
-const CUSTOM_AUTO_RECENT_DOWN_SAMPLE_COUNT = 3;
-const CUSTOM_AUTO_UP_PERCENTILE = 0.25;
-const CUSTOM_AUTO_DOWN_PERCENTILE = 0.10;
-const CUSTOM_AUTO_DISPLAY_PERCENTILE = 0.50;
+const HLS_ABR_GOVERNOR_TICK_MS = 2000;
+const HLS_ABR_SEEK_GRACE_MS = 10000;
 
 function getHlsAbrOptions(options) {
     if (!options.adaptiveBitrateStreaming) {
@@ -238,9 +241,13 @@ function getHlsAbrOptions(options) {
 
     const initialBandwidthEstimate = parseInt(options.initialBandwidthEstimate, 10);
     const abrOptions = {
-        capLevelOnFPSDrop: !(browser.iOS || browser.safari),
+        autoStartLoad: false,
+        ...getHlsAbrPlatformOptions({
+            isIos: browser.iOS,
+            isSafari: browser.safari
+        }),
         testBandwidth: false,
-        startLevel: options.initialMaxStreamingBitrate ? undefined : -1
+        startLevel: -1
     };
 
     if (browser.iOS || browser.safari) {
@@ -253,11 +260,12 @@ function getHlsAbrOptions(options) {
         });
     }
 
-    if (Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0) {
-        const bandwidthEstimate = Math.max(initialBandwidthEstimate, MIN_HLS_BANDWIDTH_ESTIMATE);
-        abrOptions.abrEwmaDefaultEstimate = bandwidthEstimate;
-        abrOptions.abrEwmaDefaultEstimateMax = Math.max(bandwidthEstimate, Hls.DefaultConfig.abrEwmaDefaultEstimateMax);
-    }
+    const startupBandwidthEstimate = Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0 ?
+        initialBandwidthEstimate :
+        CUSTOM_AUTO_INITIAL_BITRATE;
+    const bandwidthEstimate = Math.max(startupBandwidthEstimate, MIN_HLS_BANDWIDTH_ESTIMATE);
+    abrOptions.abrEwmaDefaultEstimate = bandwidthEstimate;
+    abrOptions.abrEwmaDefaultEstimateMax = Math.max(bandwidthEstimate, Hls.DefaultConfig.abrEwmaDefaultEstimateMax);
 
     return abrOptions;
 }
@@ -303,7 +311,7 @@ function getHlsBufferOptions(player, options) {
     };
 }
 
-function useCustomHlsAutoBitrate(options) {
+function useHlsAbrGovernor(options) {
     return options.adaptiveBitrateStreaming;
 }
 
@@ -343,159 +351,6 @@ function getHlsLevelTargetDuration(hls, levelIndex) {
 function getHlsForwardBufferCap(hls) {
     const cap = hls?.config?.maxMaxBufferLength || hls?.config?.maxBufferLength || 0;
     return Number.isFinite(cap) && cap > 0 ? cap : 0;
-}
-
-function pruneCustomAutoBufferSamples(samples, now) {
-    if (!samples?.length) {
-        return [];
-    }
-
-    const minTime = now - CUSTOM_AUTO_BUFFER_WINDOW_MS;
-    return samples.filter(sample => sample.time >= minTime);
-}
-
-function getCustomAutoBufferTrend(samples, now, windowMs) {
-    const trendSamples = samples.filter(sample => sample.time >= now - windowMs);
-    if (trendSamples.length < 2) {
-        return 0;
-    }
-
-    const firstSample = trendSamples[0];
-    const lastSample = trendSamples[trendSamples.length - 1];
-    const elapsedSeconds = (lastSample.time - firstSample.time) / 1000;
-
-    return elapsedSeconds > 0 ? (lastSample.buffer - firstSample.buffer) / elapsedSeconds : 0;
-}
-
-function getCustomAutoBufferWindowStats(samples, now, configuredCap) {
-    const windowSamples = pruneCustomAutoBufferSamples(samples, now);
-    const buffers = windowSamples
-        .map(sample => sample.buffer)
-        .filter(buffer => Number.isFinite(buffer) && buffer >= 0);
-    const detectedCap = buffers.length ? Math.max(...buffers) : 0;
-    const effectiveCap = Math.max(
-        configuredCap > 0 ? Math.min(configuredCap, detectedCap || configuredCap) : detectedCap,
-        1
-    );
-    const currentBuffer = buffers.length ? buffers[buffers.length - 1] : 0;
-
-    return {
-        samples: windowSamples,
-        sampleCount: buffers.length,
-        detectedCap: effectiveCap,
-        ratio: Math.min(currentBuffer / effectiveCap, 1),
-        shortTrend: getCustomAutoBufferTrend(windowSamples, now, CUSTOM_AUTO_BUFFER_SHORT_WINDOW_MS),
-        longTrend: getCustomAutoBufferTrend(windowSamples, now, CUSTOM_AUTO_BUFFER_WINDOW_MS)
-    };
-}
-
-function getCustomAutoSegmentBandwidthSample(data) {
-    const stats = data?.frag?.stats || data?.part?.stats;
-    const loaded = stats?.loaded || stats?.total || data?.payload?.byteLength || 0;
-    const loading = stats?.loading || {};
-    const start = loading.first || loading.start || 0;
-    const end = loading.end || 0;
-    const elapsedMs = end - start;
-
-    if (loaded > 0 && elapsedMs > 0) {
-        return {
-            bandwidth: (loaded * 8000) / elapsedMs,
-            elapsedMs,
-            loaded
-        };
-    }
-
-    const bandwidthEstimate = stats?.bwEstimate;
-    return Number.isFinite(bandwidthEstimate) && bandwidthEstimate > 0 ? {
-        bandwidth: bandwidthEstimate,
-        elapsedMs: 0,
-        loaded
-    } : null;
-}
-
-function pruneCustomAutoBandwidthSamples(samples, now) {
-    if (!samples?.length) {
-        return [];
-    }
-
-    const minTime = now - CUSTOM_AUTO_BANDWIDTH_WINDOW_MS;
-    return samples.filter(sample => sample.time >= minTime);
-}
-
-function getCustomAutoPercentile(values, percentile) {
-    if (!values.length) {
-        return 0;
-    }
-
-    if (values.length === 1) {
-        return values[0];
-    }
-
-    const index = Math.min(values.length - 1, Math.max(0, Math.ceil(values.length * percentile) - 1));
-    return values[index];
-}
-
-function getCustomAutoBandwidthWindowStats(samples, now, levelFilter = null, minSampleTime = 0) {
-    const windowSamples = pruneCustomAutoBandwidthSamples(samples, now)
-        .filter(sample => (levelFilter == null || sample.level === levelFilter) && sample.time >= minSampleTime);
-    const bandwidths = windowSamples
-        .map(sample => sample.bandwidth)
-        .filter(bandwidth => Number.isFinite(bandwidth) && bandwidth > 0)
-        .sort((a, b) => a - b);
-
-    if (!bandwidths.length) {
-        return {
-            samples: windowSamples,
-            sampleCount: 0,
-            upBandwidth: 0,
-            downBandwidth: 0,
-            displayBandwidth: 0
-        };
-    }
-
-    const recentBandwidths = windowSamples
-        .slice(-CUSTOM_AUTO_RECENT_DOWN_SAMPLE_COUNT)
-        .map(sample => sample.bandwidth)
-        .filter(bandwidth => Number.isFinite(bandwidth) && bandwidth > 0);
-    const downBandwidth = getCustomAutoPercentile(bandwidths, CUSTOM_AUTO_DOWN_PERCENTILE);
-    const recentDownBandwidth = recentBandwidths.length ? Math.min(...recentBandwidths) : downBandwidth;
-
-    return {
-        samples: windowSamples,
-        sampleCount: bandwidths.length,
-        upBandwidth: getCustomAutoPercentile(bandwidths, CUSTOM_AUTO_UP_PERCENTILE),
-        downBandwidth: Math.min(downBandwidth, recentDownBandwidth),
-        displayBandwidth: getCustomAutoPercentile(bandwidths, CUSTOM_AUTO_DISPLAY_PERCENTILE)
-    };
-}
-
-function resetCustomAutoHlsBufferLimit(hls) {
-    if (!hls?.config) {
-        return;
-    }
-
-    hls.config.maxBufferLength = Math.max(hls.config.maxBufferLength || 0, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH);
-    hls.config.maxMaxBufferLength = Math.max(hls.config.maxMaxBufferLength || 0, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH);
-    hls.config.maxBufferSize = Math.max(hls.config.maxBufferSize || 0, CUSTOM_ABR_HLS_MAX_BUFFER_SIZE);
-}
-
-function getInitialCustomAutoLevel(hls) {
-    const manualLevel = hls.manualLevel;
-    if (manualLevel > -1) {
-        return manualLevel;
-    }
-
-    const currentLevel = hls.currentLevel;
-    if (currentLevel > -1) {
-        return currentLevel;
-    }
-
-    const loadLevel = hls.loadLevel;
-    if (loadLevel > -1) {
-        return loadLevel;
-    }
-
-    return getManualHlsLevelForBitrate(hls.levels, CUSTOM_AUTO_INITIAL_BITRATE);
 }
 
 function getHlsFragmentRuntimeOffset(frag) {
@@ -710,97 +565,37 @@ export class HtmlVideoPlayer {
      */
     _hlsPlayer;
     /**
+     * @type {HlsAbrGovernor | undefined}
+     */
+    _hlsAbrGovernor;
+    /**
      * @type {number | undefined}
      */
-    _customAutoBitrateTimer;
+    _hlsAbrGovernorTimer;
+    /**
+     * @type {WeakSet<object> | undefined}
+     */
+    _hlsAbrLoadTokens;
+    /**
+     * @type {Map<object, { failedLevel: number, nativeEmergencyLevel?: number, stats: any }> | undefined}
+     */
+    _hlsAbrPendingEmergencies;
     /**
      * @type {boolean | undefined}
      */
-    _customAutoBitrateEnabled;
+    _hlsAbrSeeking;
     /**
      * @type {number | undefined}
      */
-    _customAutoBitratePeakBuffer;
+    _hlsAbrSeekGraceUntil;
+    /**
+     * @type {number}
+     */
+    _hlsSourceGeneration = 0;
     /**
      * @type {number | undefined}
      */
-    _customAutoBitrateLastBuffer;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateLastCheckTime;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateLastSwitchTime;
-    /**
-     * @type {'up' | 'down' | undefined}
-     */
-    _customAutoBitrateLastSwitchDirection;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateLastSwitchLevel;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateLastTrend;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateBandwidthEstimate;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateBandwidthSampleCount;
-    /**
-     * @type {{ time: number, bandwidth: number, elapsedMs: number, loaded: number, level?: number }[] | undefined}
-     */
-    _customAutoBitrateBandwidthSamples;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBufferDetectedCap;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBufferRatio;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBufferShortTrend;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBufferLongTrend;
-    /**
-     * @type {{ time: number, buffer: number, level: number }[] | undefined}
-     */
-    _customAutoBufferSamples;
-    /**
-     * @type {boolean | undefined}
-     */
-    _customAutoBufferPaused;
-    /**
-     * @type {boolean | undefined}
-     */
-    _customAutoBufferSeeking;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoLastSeekTime;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateDesiredLevel;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateDownLevel;
-    /**
-     * @type {number | undefined}
-     */
-    _customAutoBitrateControlledLevel;
+    _activeSourceGeneration;
     /**
      * @type {number | undefined}
      */
@@ -835,34 +630,61 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    stopCustomAutoBitrate() {
-        this._customAutoBitrateEnabled = false;
-        this._customAutoBitratePeakBuffer = undefined;
-        this._customAutoBitrateLastBuffer = undefined;
-        this._customAutoBitrateLastCheckTime = undefined;
-        this._customAutoBitrateLastSwitchTime = undefined;
-        this._customAutoBitrateLastSwitchDirection = undefined;
-        this._customAutoBitrateLastSwitchLevel = undefined;
-        this._customAutoBitrateLastTrend = undefined;
-        this._customAutoBitrateBandwidthEstimate = undefined;
-        this._customAutoBitrateBandwidthSampleCount = undefined;
-        this._customAutoBitrateBandwidthSamples = undefined;
-        this._customAutoBufferDetectedCap = undefined;
-        this._customAutoBufferRatio = undefined;
-        this._customAutoBufferShortTrend = undefined;
-        this._customAutoBufferLongTrend = undefined;
-        this._customAutoBufferSamples = undefined;
-        this._customAutoBufferPaused = undefined;
-        this._customAutoBufferSeeking = undefined;
-        this._customAutoLastSeekTime = undefined;
-        this._customAutoBitrateDesiredLevel = undefined;
-        this._customAutoBitrateDownLevel = undefined;
-        this._customAutoBitrateControlledLevel = undefined;
+    stopHlsAbrGovernor() {
+        const capLevel = this._hlsAbrGovernor?.getState().capLevel;
+        this.cancelPendingHlsAbrProbe(capLevel);
+        if (this._hlsAbrGovernor) {
+            this._hlsAbrGovernor.stop();
+            this._hlsAbrGovernor = undefined;
 
-        if (this._customAutoBitrateTimer) {
-            clearInterval(this._customAutoBitrateTimer);
-            this._customAutoBitrateTimer = undefined;
+            if (this._hlsPlayer) {
+                this._hlsPlayer.autoLevelCapping = -1;
+            }
         }
+
+        if (this._hlsAbrGovernorTimer) {
+            clearInterval(this._hlsAbrGovernorTimer);
+            this._hlsAbrGovernorTimer = undefined;
+        }
+
+        this._hlsAbrLoadTokens = undefined;
+        this._hlsAbrPendingEmergencies?.clear();
+        this._hlsAbrPendingEmergencies = undefined;
+        this._hlsAbrActiveLoadToken = undefined;
+        this._hlsAbrActiveMainLevel = undefined;
+        this._hlsAbrBufferFullCount = undefined;
+        this._hlsAbrPendingProbeLevel = undefined;
+        this._hlsAbrSeeking = undefined;
+        this._hlsAbrSeekGraceUntil = undefined;
+    }
+
+    /**
+     * @private
+     */
+    cancelPendingHlsAbrProbe(maximumLevel) {
+        const pendingLevel = this._hlsAbrPendingProbeLevel;
+        const hls = this._hlsPlayer;
+        if (!Number.isInteger(pendingLevel) || !hls?.levels?.length) {
+            this._hlsAbrPendingProbeLevel = undefined;
+            return;
+        }
+
+        const state = this._hlsAbrGovernor?.getState();
+        const safeMaximum = Number.isInteger(maximumLevel) ? maximumLevel : state?.capLevel;
+        const fallbackLevel = [this._hlsAbrActiveMainLevel, state?.lastLoadedLevel, hls.currentLevel, 0]
+            .find(level => Number.isInteger(level) && level >= 0 && level <= safeMaximum);
+        hls.nextAutoLevel = Number.isInteger(fallbackLevel) ? fallbackLevel : Math.max(safeMaximum || 0, 0);
+        this._hlsAbrPendingProbeLevel = undefined;
+    }
+
+    /**
+     * @private
+     */
+    resetHlsAbrGovernorForSeek(nowMs) {
+        const governor = this._hlsAbrGovernor;
+        const decision = governor?.resetForSeek(nowMs);
+        this.cancelPendingHlsAbrProbe(decision?.capLevel ?? governor?.getState().capLevel);
+        this.applyHlsAbrDecision(decision);
     }
 
     /**
@@ -899,201 +721,245 @@ export class HtmlVideoPlayer {
 
     /**
      * @private
+     * @param {number} [bandwidthEstimate]
      */
-    startCustomAutoBitrate() {
+    startHlsAbrGovernor(bandwidthEstimate) {
         const hls = this._hlsPlayer;
         if (!hls?.levels?.length || hls.levels.length < 2) {
-            return;
+            return false;
         }
 
-        this._customAutoBitrateEnabled = true;
-        resetCustomAutoHlsBufferLimit(hls);
+        this.stopHlsAbrGovernor();
 
-        const initialLevel = getInitialCustomAutoLevel(hls);
-        if (initialLevel > -1) {
-            hls.loadLevel = initialLevel;
+        const nowMs = performance.now();
+        const configuredBandwidthEstimate = Number.parseInt(this._currentPlayOptions?.initialBandwidthEstimate, 10);
+        const initialBandwidthEstimate = Number.isFinite(bandwidthEstimate) && bandwidthEstimate > 0 ?
+            bandwidthEstimate :
+            configuredBandwidthEstimate;
+        const governor = new HlsAbrGovernor({
+            levels: hls.levels.map((level, index) => ({
+                index,
+                bitrate: getHlsLevelBitrate(level)
+            })),
+            nowMs,
+            initialBandwidthEstimate: Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0 ?
+                initialBandwidthEstimate :
+                undefined,
+            initialBitrate: CUSTOM_AUTO_INITIAL_BITRATE,
+            configuredBufferCapSeconds: getHlsForwardBufferCap(hls)
+        });
+
+        if (!governor.hasMultipleLevels) {
+            return false;
         }
 
-        const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
-        this._customAutoBitratePeakBuffer = bufferedAhead;
-        this._customAutoBitrateLastBuffer = bufferedAhead;
-        this._customAutoBitrateLastCheckTime = performance.now();
-        this._customAutoBitrateLastSwitchTime = performance.now();
-        this._customAutoBitrateLastSwitchDirection = undefined;
-        this._customAutoBitrateLastSwitchLevel = initialLevel;
-        this._customAutoBitrateDesiredLevel = initialLevel;
-        this._customAutoBitrateDownLevel = initialLevel;
-        this._customAutoBitrateControlledLevel = initialLevel;
-        this._customAutoBitrateBandwidthSamples = [];
-        this._customAutoBufferSamples = [];
-        this._customAutoBufferPaused = false;
-        this._customAutoBufferSeeking = false;
-        this._customAutoLastSeekTime = undefined;
+        this._hlsAbrGovernor = governor;
+        this._hlsAbrLoadTokens = new WeakSet();
+        this._hlsAbrPendingEmergencies = new Map();
+        this._hlsAbrActiveLoadToken = undefined;
+        this._hlsAbrActiveMainLevel = undefined;
+        this._hlsAbrBufferFullCount = 0;
+        this._hlsAbrPendingProbeLevel = undefined;
+        this._hlsAbrSeeking = false;
+        this._hlsAbrSeekGraceUntil = undefined;
+        hls.startLevel = -1;
+        hls.loadLevel = -1;
+        hls.autoLevelCapping = governor.initialCapLevel;
 
-        if (!this._customAutoBitrateTimer) {
-            this._customAutoBitrateTimer = setInterval(() => {
-                this.updateCustomAutoBitrate();
-            }, CUSTOM_AUTO_TICK_MS);
-        }
+        this._hlsAbrGovernorTimer = setInterval(() => {
+            this.flushPendingHlsAbrEmergencies();
+            this.updateHlsAbrGovernor();
+        }, HLS_ABR_GOVERNOR_TICK_MS);
 
-        this.updateCustomAutoBitrate();
+        this.updateHlsAbrGovernor();
+        return true;
     }
 
     /**
      * @private
      */
-    recordCustomAutoBitrateSample(data) {
-        if (!this._customAutoBitrateEnabled) {
+    recordHlsAbrFragment(data) {
+        const governor = this._hlsAbrGovernor;
+        if (!governor) {
             return;
         }
 
-        const sample = getCustomAutoSegmentBandwidthSample(data);
-        if (!sample || !Number.isFinite(sample.bandwidth) || sample.bandwidth <= 0) {
-            return;
-        }
+        const frag = data?.frag;
+        const stats = data?.part?.stats || data?.stats || frag?.stats;
+        const loadingStats = stats?.loading;
+        const level = Number(frag?.level ?? -1);
+        const durationSeconds = Number(
+            data?.part?.duration
+            ?? frag?.duration
+            ?? getHlsLevelTargetDuration(this._hlsPlayer, level)
+        );
 
-        if (sample.loaded > 0 && sample.loaded < CUSTOM_AUTO_MIN_SAMPLE_BYTES) {
-            return;
-        }
-
-        const now = performance.now();
-        const samples = pruneCustomAutoBandwidthSamples(this._customAutoBitrateBandwidthSamples || [], now);
-        samples.push({
-            time: now,
-            bandwidth: sample.bandwidth,
-            elapsedMs: sample.elapsedMs,
-            loaded: sample.loaded,
-            level: data?.frag?.level
+        governor.recordFragment({
+            aborted: Boolean(stats?.aborted),
+            durationSeconds,
+            isInitSegment: frag?.sn === 'initSegment',
+            isMain: frag?.type === 'main',
+            level,
+            loadedBytes: Number(stats?.loaded ?? stats?.total ?? data?.payload?.byteLength ?? 0),
+            loadingEndMs: Number(loadingStats?.end ?? 0),
+            loadingFirstMs: Number(loadingStats?.first ?? 0),
+            loadingStartMs: Number(loadingStats?.start ?? 0),
+            nowMs: performance.now()
         });
-        this._customAutoBitrateBandwidthSamples = samples;
-
-        const stats = getCustomAutoBandwidthWindowStats(samples, now);
-        this._customAutoBitrateBandwidthEstimate = stats.displayBandwidth;
-        this._customAutoBitrateBandwidthSampleCount = stats.sampleCount;
-
-        this.updateCustomAutoBitrate();
     }
 
     /**
      * @private
      */
-    updateCustomAutoBitrate() {
-        const hls = this._hlsPlayer;
-        const elem = this.#mediaElement;
-        if (!this._customAutoBitrateEnabled || !hls?.levels?.length || hls.levels.length < 2 || !elem) {
-            return;
-        }
-
-        resetCustomAutoHlsBufferLimit(hls);
-
-        const currentLevel = getCustomAutoControlledLevel(hls, this._customAutoBitrateControlledLevel);
-        const bufferedAhead = getHlsBufferedAhead(hls, elem);
-        const now = performance.now();
-        let isSeeking = elem.seeking || this._customAutoBufferSeeking;
-        if (this._customAutoBufferSeeking
-            && !elem.seeking
-            && this._customAutoLastSeekTime != null
-            && now - this._customAutoLastSeekTime >= CUSTOM_AUTO_SEEK_DOWN_GRACE_MS) {
-            this._customAutoBufferSeeking = false;
-            isSeeking = false;
-        }
-        const isSeekDownGrace = isSeeking
-            || (this._customAutoLastSeekTime != null && now - this._customAutoLastSeekTime < CUSTOM_AUTO_SEEK_DOWN_GRACE_MS);
-
-        if (elem.paused) {
-            this._customAutoBufferPaused = true;
-            this._customAutoBitrateLastBuffer = bufferedAhead;
-            this._customAutoBitrateLastCheckTime = now;
-            return;
-        }
-
-        if (isSeeking) {
-            this._customAutoBufferSamples = [];
-            this._customAutoBitratePeakBuffer = bufferedAhead;
-            this._customAutoBitrateLastBuffer = bufferedAhead;
-            this._customAutoBitrateLastCheckTime = now;
-            return;
-        }
-
-        if (this._customAutoBufferPaused) {
-            this._customAutoBufferSamples = [];
-            this._customAutoBitrateLastBuffer = bufferedAhead;
-            this._customAutoBitrateLastCheckTime = now;
-            this._customAutoBufferPaused = false;
-        }
-
-        const segmentDuration = getHlsLevelTargetDuration(hls, currentLevel);
-        const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
-        const configuredBufferCap = getHlsForwardBufferCap(hls);
-        const bufferSamples = pruneCustomAutoBufferSamples(this._customAutoBufferSamples || [], now);
-        bufferSamples.push({
-            time: now,
-            buffer: bufferedAhead,
-            level: currentLevel
-        });
-        this._customAutoBufferSamples = bufferSamples;
-
-        const bufferStats = getCustomAutoBufferWindowStats(bufferSamples, now, configuredBufferCap);
-        const bufferTrend = bufferStats.shortTrend;
-        const peakBuffer = Math.max(this._customAutoBitratePeakBuffer || 0, bufferedAhead, bufferStats.detectedCap);
-        const isPostUpGrace = this._customAutoBitrateLastSwitchDirection === 'up'
-            && switchAge < CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS;
-        const hasFullBuffer = bufferStats.sampleCount >= 3
-            && bufferStats.ratio >= CUSTOM_AUTO_BUFFER_FULL_RATIO
-            && bufferStats.longTrend >= CUSTOM_AUTO_BUFFER_STABLE_TREND
-            && bufferStats.shortTrend >= CUSTOM_AUTO_BUFFER_FAST_DRAIN_TREND;
-        const hasBufferPressure = bufferStats.ratio <= CUSTOM_AUTO_BUFFER_CRITICAL_RATIO
-            || bufferedAhead <= segmentDuration
-            || (bufferStats.ratio <= CUSTOM_AUTO_BUFFER_LOW_RATIO && bufferStats.longTrend <= CUSTOM_AUTO_BUFFER_DRAIN_TREND)
-            || bufferStats.shortTrend <= CUSTOM_AUTO_BUFFER_FAST_DRAIN_TREND;
-        const bandwidthStats = getCustomAutoBandwidthWindowStats(this._customAutoBitrateBandwidthSamples || [], now);
-        this._customAutoBitrateBandwidthSamples = bandwidthStats.samples;
-        this._customAutoBitrateBandwidthEstimate = bandwidthStats.displayBandwidth || hls.bandwidthEstimate || 0;
-        this._customAutoBitrateBandwidthSampleCount = bandwidthStats.sampleCount;
-
-        const bandwidthEstimate = this._customAutoBitrateBandwidthEstimate || 0;
-        const upLevel = hasFullBuffer && currentLevel < hls.levels.length - 1 ? currentLevel + 1 : currentLevel;
-        const downLevel = hasBufferPressure && currentLevel > 0 ? currentLevel - 1 : currentLevel;
-
-        this._customAutoBitratePeakBuffer = peakBuffer;
-        this._customAutoBitrateLastBuffer = bufferedAhead;
-        this._customAutoBitrateLastCheckTime = now;
-        this._customAutoBitrateLastTrend = bufferTrend;
-        this._customAutoBitrateDesiredLevel = upLevel;
-        this._customAutoBitrateDownLevel = downLevel;
-        this._customAutoBufferDetectedCap = bufferStats.detectedCap;
-        this._customAutoBufferRatio = bufferStats.ratio;
-        this._customAutoBufferShortTrend = bufferStats.shortTrend;
-        this._customAutoBufferLongTrend = bufferStats.longTrend;
-
-        if (hasFullBuffer
-            && switchAge >= CUSTOM_AUTO_UP_SWITCH_INTERVAL_MS
-            && currentLevel < hls.levels.length - 1) {
-            const nextLevel = currentLevel + 1;
-            this._customAutoBitratePeakBuffer = bufferedAhead;
-            this._customAutoBitrateLastSwitchTime = now;
-            this._customAutoBitrateLastSwitchDirection = 'up';
-            this._customAutoBitrateLastSwitchLevel = nextLevel;
-            this._customAutoBitrateControlledLevel = nextLevel;
-            resetCustomAutoHlsBufferLimit(hls);
-            hls.loadLevel = nextLevel;
-            console.debug(`custom hls auto buffer up: level=${nextLevel} buffer=${bufferedAhead.toFixed(1)}s detectedCap=${bufferStats.detectedCap.toFixed(1)}s ratio=${bufferStats.ratio.toFixed(2)} shortTrend=${bufferStats.shortTrend.toFixed(2)}s/s longTrend=${bufferStats.longTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)}`);
-            return;
-        }
-
-        if (!isSeekDownGrace && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
-            if ((!isPostUpGrace || hasBufferPressure) && downLevel < currentLevel) {
-                this._customAutoBitratePeakBuffer = bufferedAhead;
-                this._customAutoBitrateLastSwitchTime = now;
-                this._customAutoBitrateLastSwitchDirection = 'down';
-                this._customAutoBitrateLastSwitchLevel = downLevel;
-                this._customAutoBitrateControlledLevel = downLevel;
-                resetCustomAutoHlsBufferLimit(hls);
-                hls.loadLevel = downLevel;
-                console.debug(`custom hls auto buffer down: level=${downLevel} buffer=${bufferedAhead.toFixed(1)}s detectedCap=${bufferStats.detectedCap.toFixed(1)}s ratio=${bufferStats.ratio.toFixed(2)} shortTrend=${bufferStats.shortTrend.toFixed(2)}s/s longTrend=${bufferStats.longTrend.toFixed(2)}s/s bwe=${Math.round(bandwidthEstimate)}`);
-                return;
+    flushPendingHlsAbrEmergencies() {
+        for (const [loadToken, emergency] of this._hlsAbrPendingEmergencies || []) {
+            if (emergency.stats?.aborted) {
+                this.handleHlsAbrEmergency(loadToken, emergency);
+            } else if (emergency.stats?.loading?.end > 0) {
+                this._hlsAbrPendingEmergencies?.delete(loadToken);
             }
         }
+    }
+
+    /**
+     * @private
+     */
+    handleHlsAbrEmergency(loadToken, emergency) {
+        this._hlsAbrPendingEmergencies?.delete(loadToken);
+        if (!this._hlsAbrLoadTokens?.has(loadToken)) {
+            return;
+        }
+
+        this._hlsAbrLoadTokens.delete(loadToken);
+        const hls = this._hlsPlayer;
+        const latestEmergencyLevel = hls?.nextAutoLevel;
+        const nativeEmergencyLevel = Number.isInteger(latestEmergencyLevel)
+            && latestEmergencyLevel >= 0
+            && latestEmergencyLevel < emergency.failedLevel ?
+            Math.min(latestEmergencyLevel, emergency.nativeEmergencyLevel ?? latestEmergencyLevel) :
+            emergency.nativeEmergencyLevel;
+        this.updateHlsAbrGovernor({
+            currentLevel: emergency.failedLevel,
+            isEmergency: true,
+            nativeEmergencyLevel
+        });
+    }
+
+    /**
+     * @private
+     * @param {{ currentLevel?: number, isEmergency?: boolean, isWaiting?: boolean, nativeEmergencyLevel?: number }} [flags]
+     */
+    updateHlsAbrGovernor(flags = {}) {
+        const governor = this._hlsAbrGovernor;
+        const hls = this._hlsPlayer;
+        const elem = this.#mediaElement;
+        if (!governor || !hls?.levels?.length || !elem) {
+            return;
+        }
+
+        const selectedLevel = [
+            flags.currentLevel,
+            hls.loadLevel,
+            hls.nextAutoLevel,
+            hls.currentLevel,
+            hls.firstLevel,
+            0
+        ].find(level => Number.isInteger(level) && level >= 0);
+        const currentLevel = Math.min(selectedLevel, hls.levels.length - 1);
+        const nowMs = performance.now();
+        const decision = governor.observe({
+            bufferSeconds: getHlsBufferedAhead(hls, elem),
+            configuredBufferCapSeconds: getHlsForwardBufferCap(hls),
+            currentLevel,
+            hlsBandwidthEstimate: hls.bandwidthEstimate,
+            isEmergency: Boolean(flags.isEmergency),
+            isEnded: elem.ended,
+            isLive: Boolean(hls.levels[currentLevel]?.details?.live || hls.latestLevelDetails?.live),
+            isPaused: elem.paused,
+            isSeeking: elem.seeking
+                || this._hlsAbrSeeking
+                || (this._hlsAbrSeekGraceUntil != null && nowMs < this._hlsAbrSeekGraceUntil),
+            isWaiting: Boolean(flags.isWaiting),
+            nativeEmergencyLevel: flags.nativeEmergencyLevel,
+            nowMs,
+            playbackRate: elem.playbackRate,
+            segmentDurationSeconds: getHlsLevelTargetDuration(hls, currentLevel)
+        });
+
+        this.applyHlsAbrDecision(decision);
+    }
+
+    /**
+     * @private
+     */
+    applyHlsAbrDecision(decision) {
+        const hls = this._hlsPlayer;
+        if (!decision || !hls?.levels?.length) {
+            return;
+        }
+
+        const maximumLevel = hls.levels.length - 1;
+        const requestedProbeLevel = decision.probeLevel;
+        const governorState = this._hlsAbrGovernor?.getState();
+        const governorStillExpectsPendingProbe = governorState?.probationProbePending
+            && governorState.probationLevel === this._hlsAbrPendingProbeLevel;
+        if (Number.isInteger(this._hlsAbrPendingProbeLevel)
+            && requestedProbeLevel !== this._hlsAbrPendingProbeLevel
+            && !governorStillExpectsPendingProbe) {
+            this.cancelPendingHlsAbrProbe(decision.capLevel);
+        }
+
+        let effectiveDecision = decision;
+        let capLevel = Math.min(Math.max(effectiveDecision.capLevel, 0), maximumLevel);
+        hls.autoLevelCapping = capLevel;
+        let appliedProbeLevel;
+
+        if (effectiveDecision.forceLevel != null) {
+            const forceLevel = Math.min(Math.max(effectiveDecision.forceLevel, 0), capLevel);
+            hls.nextAutoLevel = forceLevel;
+            hls.nextLoadLevel = forceLevel;
+        }
+
+        if (effectiveDecision.probeLevel != null) {
+            const probeLevel = Math.min(Math.max(effectiveDecision.probeLevel, 0), capLevel);
+            const state = this._hlsAbrGovernor?.getState();
+            const activeLevel = Number.isInteger(this._hlsAbrActiveMainLevel) ?
+                this._hlsAbrActiveMainLevel :
+                state?.lastLoadedLevel;
+            if (Number.isInteger(activeLevel)
+                && activeLevel >= probeLevel
+                && this._hlsAbrGovernor?.confirmProbe(activeLevel)) {
+                appliedProbeLevel = activeLevel;
+            } else if (canApplyHlsAbrProbe(hls, probeLevel, activeLevel)) {
+                hls.nextAutoLevel = probeLevel;
+                this._hlsAbrPendingProbeLevel = probeLevel;
+                appliedProbeLevel = probeLevel;
+            } else {
+                const rejectedDecision = this._hlsAbrGovernor?.rejectProbe(
+                    probeLevel,
+                    performance.now()
+                );
+                if (rejectedDecision) {
+                    effectiveDecision = rejectedDecision;
+                    capLevel = Math.min(Math.max(effectiveDecision.capLevel, 0), maximumLevel);
+                    hls.autoLevelCapping = capLevel;
+                }
+            }
+        }
+
+        console.debug(`hls abr governor: reason=${effectiveDecision.reason} phase=${effectiveDecision.phase} cap=${capLevel} force=${effectiveDecision.forceLevel ?? 'none'} probe=${requestedProbeLevel ?? 'none'} appliedProbe=${appliedProbeLevel ?? 'none'}`);
+    }
+
+    /**
+     * @private
+     */
+    setHlsAbrHardCap(level) {
+        if (!Number.isInteger(level) || level < 0) {
+            return;
+        }
+
+        const decision = this._hlsAbrGovernor?.setHardCap(level);
+        this.applyHlsAbrDecision(decision);
     }
 
     /**
@@ -1123,7 +989,7 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    updateVideoUrl(streamInfo) {
+    updateVideoUrl(streamInfo, sourceGeneration) {
         const mediaSource = streamInfo.mediaSource;
         const item = streamInfo.item;
 
@@ -1142,12 +1008,20 @@ export class HtmlVideoPlayer {
                 type: 'GET',
                 url: hlsPlaylistUrl
 
-            }).then(function () {
+            }).then(() => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+
                 console.debug(`completed prefetching hls playlist: ${hlsPlaylistUrl}`);
 
                 loading.hide();
                 streamInfo.url = hlsPlaylistUrl;
-            }, function () {
+            }, () => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+
                 console.error(`error prefetching hls playlist: ${hlsPlaylistUrl}`);
 
                 loading.hide();
@@ -1158,6 +1032,7 @@ export class HtmlVideoPlayer {
     }
 
     async play(options) {
+        const sourceGeneration = ++this._hlsSourceGeneration;
         this.#started = false;
         this.#timeUpdated = false;
 
@@ -1165,18 +1040,45 @@ export class HtmlVideoPlayer {
 
         if (options.resetSubtitleOffset !== false) this.resetSubtitleOffset();
 
-        const elem = await this.createMediaElement(options);
+        let elem;
+        try {
+            elem = await this.createMediaElement(options, sourceGeneration);
+        } catch (error) {
+            if (sourceGeneration !== this._hlsSourceGeneration) {
+                return;
+            }
+            throw error;
+        }
+        if (sourceGeneration !== this._hlsSourceGeneration) {
+            return;
+        }
+
         this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
 
-        await this.updateVideoUrl(options);
-        return this.setCurrentSrc(elem, options);
+        try {
+            await this.updateVideoUrl(options, sourceGeneration);
+        } catch (error) {
+            if (sourceGeneration !== this._hlsSourceGeneration) {
+                return;
+            }
+            throw error;
+        }
+        if (sourceGeneration !== this._hlsSourceGeneration) {
+            return;
+        }
+
+        return this.setCurrentSrc(elem, options, sourceGeneration);
     }
 
     /**
      * @private
      */
-    setSrcWithFlvJs(elem, options, url) {
+    setSrcWithFlvJs(elem, options, url, sourceGeneration) {
         return import('flv.js').then(({ default: flvjs }) => {
+            if (sourceGeneration !== this._hlsSourceGeneration) {
+                return;
+            }
+
             const flvPlayer = flvjs.createPlayer({
                 type: 'flv',
                 url: url
@@ -1186,6 +1088,7 @@ export class HtmlVideoPlayer {
                 lazyLoad: false
             });
 
+            this._activeSourceGeneration = sourceGeneration;
             flvPlayer.attachMediaElement(elem);
             flvPlayer.load();
 
@@ -1195,21 +1098,56 @@ export class HtmlVideoPlayer {
             this.#currentSrc = url;
 
             return flvPlayer.play();
+        }).catch(error => {
+            if (sourceGeneration !== this._hlsSourceGeneration) {
+                return;
+            }
+            throw error;
         });
     }
 
     /**
      * @private
      */
-    setSrcWithHlsJs(elem, options, url) {
+    setSrcWithHlsJs(elem, options, url, sourceGeneration) {
         return new Promise((resolve, reject) => {
-            requireHlsPlayer(async () => {
+            let settled = false;
+            const resolvePlayback = (value) => {
+                if (!settled) {
+                    settled = true;
+                    resolve(value);
+                }
+            };
+            const rejectPlayback = (reason) => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    resolvePlayback();
+                    return;
+                }
+
+                if (!settled) {
+                    settled = true;
+                    reject(reason);
+                }
+            };
+
+            requireHlsPlayer().then(async () => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    resolvePlayback();
+                    return;
+                }
+
                 const hlsBufferOptions = getHlsBufferOptions(this, options);
 
                 const includeCorsCredentials = await getIncludeCorsCredentials();
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    resolvePlayback();
+                    return;
+                }
+
+                const startPosition = (options.playerStartPositionTicks || 0) / 10000000;
 
                 const hls = new Hls({
-                    startPosition: options.playerStartPositionTicks / 10000000,
+                    startPosition,
                     manifestLoadingTimeOut: 20000,
                     preserveManualLevelOnError: true,
                     ...getHlsAbrOptions(options),
@@ -1219,49 +1157,189 @@ export class HtmlVideoPlayer {
                         xhr.withCredentials = includeCorsCredentials;
                     }
                 });
-                hls.loadSource(url);
-                hls.attachMedia(elem);
 
-                hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                    if (options.initialMaxStreamingBitrate) {
-                        const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
-                        if (level !== -1) {
-                            resetCustomAutoHlsBufferLimit(hls);
-                            hls.loadLevel = level;
-                        }
-                    } else if (useCustomHlsAutoBitrate(options)) {
-                        this.startCustomAutoBitrate();
+                this._hlsPlayer = hls;
+                const isCurrentHls = () => sourceGeneration === this._hlsSourceGeneration
+                    && this._hlsPlayer === hls;
+                let sourceRequested = false;
+                let loadStarted = false;
+
+                const startHlsLoad = () => {
+                    if (loadStarted || !options.adaptiveBitrateStreaming) {
+                        return;
+                    }
+
+                    loadStarted = true;
+                    hls.startLoad(startPosition);
+                };
+
+                hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+                    if (!sourceRequested && isCurrentHls()) {
+                        sourceRequested = true;
+                        hls.loadSource(url);
                     }
                 });
 
-                hls.on(Hls.Events.FRAG_BUFFERED, () => {
-                    this.updateCustomAutoBitrate();
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    if (!isCurrentHls()) {
+                        return;
+                    }
+
+                    if (options.initialMaxStreamingBitrate) {
+                        const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
+                        if (level !== -1) {
+                            this.stopHlsAbrGovernor();
+                            hls.startLevel = level;
+                            hls.loadLevel = level;
+                        }
+                    } else if (useHlsAbrGovernor(options)) {
+                        if (!this.startHlsAbrGovernor()) {
+                            hls.startLevel = -1;
+                            hls.loadLevel = -1;
+                        }
+                    }
+
+                    startHlsLoad();
+                });
+
+                hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
+                    const loadToken = data.part || data.frag;
+                    if (isCurrentHls() && this._hlsAbrGovernor && loadToken) {
+                        this.flushPendingHlsAbrEmergencies();
+                        this._hlsAbrLoadTokens?.add(loadToken);
+                        if (data.frag?.type === 'main' && data.frag?.sn !== 'initSegment') {
+                            const level = Number(data.frag.level);
+                            this._hlsAbrActiveLoadToken = loadToken;
+                            this._hlsAbrActiveMainLevel = level;
+                            if (level === this._hlsAbrPendingProbeLevel
+                                && this._hlsAbrGovernor.confirmProbe(level)) {
+                                this._hlsAbrPendingProbeLevel = undefined;
+                            }
+                        }
+                    }
                 });
                 hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-                    this.recordCustomAutoBitrateSample(data);
+                    const loadToken = data.part || data.frag;
+                    if (isCurrentHls() && loadToken) {
+                        this._hlsAbrPendingEmergencies?.delete(loadToken);
+                        if (loadToken === this._hlsAbrActiveLoadToken) {
+                            this._hlsAbrActiveLoadToken = undefined;
+                            this._hlsAbrActiveMainLevel = undefined;
+                        }
+                    }
+                });
+                hls.on(Hls.Events.FRAG_BUFFERED, (event, data) => {
+                    const loadToken = data.part || data.frag;
+                    if (isCurrentHls() && loadToken && this._hlsAbrLoadTokens?.has(loadToken)) {
+                        this._hlsAbrPendingEmergencies?.delete(loadToken);
+                        this._hlsAbrLoadTokens.delete(loadToken);
+                        this.recordHlsAbrFragment(data);
+                        this.updateHlsAbrGovernor({ currentLevel: data.frag?.level });
+                    }
                 });
                 hls.on(Hls.Events.FRAG_CHANGED, (event, data) => {
-                    this.updateHlsRuntimeTimeOffset(data.frag);
+                    if (isCurrentHls()) {
+                        this.updateHlsRuntimeTimeOffset(data.frag);
+                    }
                 });
                 hls.on(Hls.Events.LEVEL_SWITCHED, () => {
-                    resetCustomAutoHlsBufferLimit(hls);
-                    this.updateCustomAutoBitrate();
+                    if (isCurrentHls()) {
+                        this.updateHlsAbrGovernor();
+                    }
+                });
+                hls.on(Hls.Events.LEVELS_UPDATED, () => {
+                    if (isCurrentHls() && this._hlsAbrGovernor) {
+                        const pendingProbeLevel = this._hlsAbrPendingProbeLevel;
+                        this._hlsAbrPendingProbeLevel = undefined;
+                        if (Number.isInteger(pendingProbeLevel)) {
+                            this.applyHlsAbrDecision(this._hlsAbrGovernor.rejectProbe(
+                                pendingProbeLevel,
+                                performance.now(),
+                                'levels-updated'
+                            ));
+                        }
+                        const decision = this._hlsAbrGovernor.updateLevels(hls.levels.map((level, index) => ({
+                            index,
+                            bitrate: getHlsLevelBitrate(level)
+                        })));
+                        if (this._hlsAbrGovernor.hasMultipleLevels) {
+                            this.applyHlsAbrDecision(decision);
+                        } else {
+                            this.stopHlsAbrGovernor();
+                        }
+                    }
+                });
+                hls.on(Hls.Events.FRAG_LOAD_EMERGENCY_ABORTED, (event, data) => {
+                    const loadToken = data.part || data.frag;
+                    const stats = data.stats || data.part?.stats || data.frag?.stats;
+                    const failedLevel = Number(data.frag?.level);
+                    const nativeEmergencyLevel = Number.isInteger(hls.nextAutoLevel)
+                        && Number.isInteger(failedLevel)
+                        && hls.nextAutoLevel >= 0
+                        && hls.nextAutoLevel < failedLevel ?
+                        hls.nextAutoLevel :
+                        undefined;
+                    if (isCurrentHls()
+                        && loadToken
+                        && this._hlsAbrLoadTokens?.has(loadToken)) {
+                        const emergency = { failedLevel, nativeEmergencyLevel, stats };
+                        // hls.js emits before a deferred abort occurs. Keep it pending until
+                        // its shared loader stats confirm the abort, or discard it when buffered.
+                        // hls.js deliberately does not abort the current request when its
+                        // emergency target is the floor, but the level-0 switch is still real.
+                        if (stats?.aborted || nativeEmergencyLevel === 0) {
+                            this.handleHlsAbrEmergency(loadToken, emergency);
+                        } else {
+                            this._hlsAbrPendingEmergencies?.set(loadToken, emergency);
+                        }
+                    }
+                });
+                hls.on(Hls.Events.FPS_DROP_LEVEL_CAPPING, (event, data) => {
+                    if (isCurrentHls()) {
+                        this.setHlsAbrHardCap(data.level);
+                        Promise.resolve().then(() => {
+                            if (isCurrentHls() && this._hlsAbrGovernor) {
+                                hls.autoLevelCapping = Math.min(
+                                    data.level,
+                                    this._hlsAbrGovernor.getState().capLevel
+                                );
+                            }
+                        });
+                    }
+                });
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (isCurrentHls() && data.details === Hls.ErrorDetails.BUFFER_FULL_ERROR) {
+                        this._hlsAbrBufferFullCount = (this._hlsAbrBufferFullCount || 0) + 1;
+                        console.warn(`hls buffer full: maxBuffer=${hls.maxBufferLength}s configMax=${hls.config.maxMaxBufferLength}s`);
+                    }
+                });
+                hls.on(Hls.Events.DESTROYING, () => {
+                    if (isCurrentHls()) {
+                        this.stopHlsAbrGovernor();
+                    }
+                    if (sourceGeneration !== this._hlsSourceGeneration) {
+                        resolvePlayback();
+                    }
                 });
 
-                bindEventsToHlsPlayer(this, hls, elem, this.onError, resolve, reject);
-
-                this._hlsPlayer = hls;
+                this._activeSourceGeneration = sourceGeneration;
+                bindEventsToHlsPlayer(this, hls, elem, this.onError, resolvePlayback, rejectPlayback);
+                hls.attachMedia(elem);
 
                 // This is needed in setCurrentTrackElement
                 this.#currentSrc = url;
-            });
+            }).catch(rejectPlayback);
         });
     }
 
     /**
      * @private
      */
-    async setCurrentSrc(elem, options) {
+    async setCurrentSrc(elem, options, sourceGeneration) {
+        if (sourceGeneration !== this._hlsSourceGeneration) {
+            return;
+        }
+
         elem.removeEventListener('error', this.onError);
 
         let val = options.url;
@@ -1273,7 +1351,7 @@ export class HtmlVideoPlayer {
             val += `#t=${seconds}`;
         }
 
-        this.stopCustomAutoBitrate();
+        this.stopHlsAbrGovernor();
         this._hlsRuntimeTimeOffset = undefined;
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
@@ -1284,7 +1362,10 @@ export class HtmlVideoPlayer {
         this.#subtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSubtitleStreamIndex;
         if (this.#subtitleTrackIndexToSetOnPlaying != null && this.#subtitleTrackIndexToSetOnPlaying >= 0) {
             const initialSubtitleStream = options.mediaSource.MediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === this.#subtitleTrackIndexToSetOnPlaying);
-            console.warn(`[PGS] initial subtitle track: index=${this.#subtitleTrackIndexToSetOnPlaying} stream=${initialSubtitleStream ? `${initialSubtitleStream.Index}/${initialSubtitleStream.Codec}/${initialSubtitleStream.DeliveryMethod || 'none'}` : 'none'} pgsClient=${isClientRenderedPgsTrack(initialSubtitleStream)}`);
+            const initialSubtitleDescription = initialSubtitleStream ?
+                `${initialSubtitleStream.Index}/${initialSubtitleStream.Codec}/${initialSubtitleStream.DeliveryMethod || 'none'}` :
+                'none';
+            console.warn(`[PGS] initial subtitle track: index=${this.#subtitleTrackIndexToSetOnPlaying} stream=${initialSubtitleDescription} pgsClient=${isClientRenderedPgsTrack(initialSubtitleStream)}`);
             if (!initialSubtitleStream || (initialSubtitleStream.DeliveryMethod === 'Encode' && !isClientRenderedPgsTrack(initialSubtitleStream))) {
                 this.#subtitleTrackIndexToSetOnPlaying = -1;
                 secondaryTrackValid = false;
@@ -1319,22 +1400,49 @@ export class HtmlVideoPlayer {
         }
 
         if (enableHlsJsPlayerForCodecs(options.mediaSource, 'Video') && isHls(options.mediaSource)) {
-            return this.setSrcWithHlsJs(elem, options, val);
+            return this.setSrcWithHlsJs(elem, options, val, sourceGeneration);
         } else if (options.playMethod !== 'Transcode' && options.mediaSource.Container?.toUpperCase() === 'FLV') {
-            return this.setSrcWithFlvJs(elem, options, val);
+            return this.setSrcWithFlvJs(elem, options, val, sourceGeneration);
         } else {
             elem.autoplay = true;
 
-            const includeCorsCredentials = await getIncludeCorsCredentials();
+            let includeCorsCredentials;
+            try {
+                includeCorsCredentials = await getIncludeCorsCredentials();
+            } catch (error) {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+                throw error;
+            }
+            if (sourceGeneration !== this._hlsSourceGeneration) {
+                return;
+            }
+
             if (includeCorsCredentials) {
                 // Safari will not send cookies without this
                 elem.crossOrigin = 'use-credentials';
             }
 
-            return applySrc(elem, val, options).then(() => {
+            return applySrc(elem, val, options, () => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return false;
+                }
+                this._activeSourceGeneration = sourceGeneration;
+                return true;
+            }).then(() => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+
                 this.#currentSrc = val;
 
                 return playWithPromise(elem, this.onError);
+            }).catch(error => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+                throw error;
             });
         }
     }
@@ -1616,6 +1724,10 @@ export class HtmlVideoPlayer {
         const elem = this.#mediaElement;
         const src = this.#currentSrc;
 
+        this._hlsSourceGeneration++;
+        this._activeSourceGeneration = undefined;
+        this.stopHlsAbrGovernor();
+
         if (elem) {
             if (src) {
                 elem.pause();
@@ -1636,7 +1748,9 @@ export class HtmlVideoPlayer {
     destroy() {
         this.setSubtitleOffset.cancel();
 
-        this.stopCustomAutoBitrate();
+        this._hlsSourceGeneration++;
+        this._activeSourceGeneration = undefined;
+        this.stopHlsAbrGovernor();
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
 
@@ -1690,6 +1804,13 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
+        if (this._activeSourceGeneration !== this._hlsSourceGeneration || !elem.ended) {
+            return;
+        }
+
+        this._hlsSourceGeneration++;
+        this._activeSourceGeneration = undefined;
+        this.stopHlsAbrGovernor();
         this.destroyCustomTrack(elem);
         onEndedInternal(this, elem, this.onError);
     };
@@ -1780,6 +1901,13 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
+        if (this._hlsAbrSeeking || this._hlsAbrSeekGraceUntil) {
+            this._hlsAbrSeeking = false;
+            this._hlsAbrSeekGraceUntil = undefined;
+            this.resetHlsAbrGovernorForSeek(performance.now());
+        }
+        this.updateHlsAbrGovernor();
+
         if (!this.#started) {
             this.#started = true;
             elem.removeAttribute('controls');
@@ -1850,6 +1978,7 @@ export class HtmlVideoPlayer {
      * @private
      */
     onPause = () => {
+        this.updateHlsAbrGovernor();
         Events.trigger(this, 'pause');
     };
 
@@ -1857,17 +1986,10 @@ export class HtmlVideoPlayer {
      * @private
      */
     onSeeking = () => {
-        this._customAutoBufferSeeking = true;
-        this._customAutoLastSeekTime = performance.now();
-
-        if (this._customAutoBitrateEnabled) {
-            const hls = this._hlsPlayer;
-            const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
-            this._customAutoBufferSamples = [];
-            this._customAutoBitratePeakBuffer = bufferedAhead;
-            this._customAutoBitrateLastBuffer = bufferedAhead;
-            this._customAutoBitrateLastCheckTime = this._customAutoLastSeekTime;
-        }
+        const nowMs = performance.now();
+        this._hlsAbrSeeking = true;
+        this._hlsAbrSeekGraceUntil = undefined;
+        this.resetHlsAbrGovernorForSeek(nowMs);
 
         Events.trigger(this, 'seeking');
     };
@@ -1876,44 +1998,17 @@ export class HtmlVideoPlayer {
      * @private
      */
     onSeeked = () => {
-        const now = performance.now();
-        this._customAutoBufferSeeking = false;
-        this._customAutoLastSeekTime = now;
-
-        if (this._customAutoBitrateEnabled) {
-            const hls = this._hlsPlayer;
-            const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
-            this._customAutoBufferSamples = [];
-            this._customAutoBitratePeakBuffer = bufferedAhead;
-            this._customAutoBitrateLastBuffer = bufferedAhead;
-            this._customAutoBitrateLastCheckTime = now;
-        }
+        const nowMs = performance.now();
+        this._hlsAbrSeeking = false;
+        this._hlsAbrSeekGraceUntil = nowMs + HLS_ABR_SEEK_GRACE_MS;
+        this.resetHlsAbrGovernorForSeek(nowMs);
 
         Events.trigger(this, 'seeked');
     };
 
     onWaiting = () => {
-        if (this._customAutoBitrateEnabled) {
-            const hls = this._hlsPlayer;
-            const currentLevel = hls ? getCustomAutoControlledLevel(hls, this._customAutoBitrateControlledLevel) : -1;
-            const now = performance.now();
-            const switchAge = now - (this._customAutoBitrateLastSwitchTime || 0);
-            const isSeekDownGrace = this.#mediaElement?.seeking
-                || this._customAutoBufferSeeking
-                || (this._customAutoLastSeekTime != null && now - this._customAutoLastSeekTime < CUSTOM_AUTO_SEEK_DOWN_GRACE_MS);
-
-            if (!isSeekDownGrace && hls && currentLevel > 0 && switchAge >= CUSTOM_AUTO_DOWN_SWITCH_INTERVAL_MS) {
-                const bufferedAhead = getHlsBufferedAhead(hls, this.#mediaElement);
-                this._customAutoBitratePeakBuffer = bufferedAhead;
-                this._customAutoBitrateLastBuffer = bufferedAhead;
-                this._customAutoBitrateLastCheckTime = now;
-                this._customAutoBitrateLastSwitchTime = now;
-                this._customAutoBitrateLastSwitchDirection = 'down';
-                this._customAutoBitrateLastSwitchLevel = currentLevel - 1;
-                this._customAutoBitrateControlledLevel = currentLevel - 1;
-                resetCustomAutoHlsBufferLimit(hls);
-                hls.loadLevel = currentLevel - 1;
-            }
+        if (this.#started) {
+            this.updateHlsAbrGovernor({ isWaiting: true });
         }
 
         Events.trigger(this, 'waiting');
@@ -2450,7 +2545,8 @@ export class HtmlVideoPlayer {
         let track = streamIndex === -1 ? null : mediaStreamTextTracks.filter(function (t) {
             return t.Index === streamIndex;
         })[0];
-        console.warn(`[PGS] text track resolved: index=${streamIndex} track=${track ? `${track.Index}/${track.Codec}/${track.DeliveryMethod || 'none'}` : 'none'} pgsClient=${isClientRenderedPgsTrack(track)}`);
+        const trackDescription = track ? `${track.Index}/${track.Codec}/${track.DeliveryMethod || 'none'}` : 'none';
+        console.warn(`[PGS] text track resolved: index=${streamIndex} track=${trackDescription} pgsClient=${isClientRenderedPgsTrack(track)}`);
 
         // This play method can only check if it is real direct play, and will mark Remux as Transcode as well
         const isDirectPlay = this._currentPlayOptions.playMethod === 'DirectPlay';
@@ -2504,11 +2600,15 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    createMediaElement(options) {
+    createMediaElement(options, sourceGeneration) {
         const dlg = document.querySelector('.videoPlayerContainer');
 
         if (!dlg) {
             return import('./style.scss').then(() => {
+                if (sourceGeneration !== this._hlsSourceGeneration) {
+                    return;
+                }
+
                 if (options.fullscreen) loading.show();
 
                 const playerDlg = document.createElement('div');
@@ -2570,7 +2670,9 @@ export class HtmlVideoPlayer {
                     // Enter fullscreen in the webOS browser to hide the top bar
                     if (!window.NativeShell && browser.web0s && Screenfull.isEnabled) {
                         Screenfull.request().then(() => {
-                            this.forcedFullscreen = true;
+                            if (sourceGeneration === this._hlsSourceGeneration) {
+                                this.forcedFullscreen = true;
+                            }
                         });
                         return videoElement;
                     }
@@ -2593,7 +2695,9 @@ export class HtmlVideoPlayer {
                 // Enter fullscreen in the webOS browser to hide the top bar
                 if (!this.forcedFullscreen && !window.NativeShell && browser.web0s && Screenfull.isEnabled) {
                     Screenfull.request().then(() => {
-                        this.forcedFullscreen = true;
+                        if (sourceGeneration === this._hlsSourceGeneration) {
+                            this.forcedFullscreen = true;
+                        }
                     });
                 }
             }
@@ -2634,7 +2738,7 @@ export class HtmlVideoPlayer {
     }
 
     enableAutomaticBitrateDetection() {
-        if (this._customAutoBitrateEnabled) {
+        if (this._hlsAbrGovernor) {
             return true;
         }
 
@@ -2664,25 +2768,27 @@ export class HtmlVideoPlayer {
         }
 
         if (options.enableAutomaticBitrateDetection || !options.maxBitrate) {
-            resetCustomAutoHlsBufferLimit(hls);
-
-            if (useCustomHlsAutoBitrate(this._currentPlayOptions || {})) {
-                this.startCustomAutoBitrate();
+            if (useHlsAbrGovernor(this._currentPlayOptions || {})) {
+                if (!this.startHlsAbrGovernor()) {
+                    hls.startLevel = -1;
+                    hls.loadLevel = -1;
+                }
             } else {
-                this.stopCustomAutoBitrate();
+                this.stopHlsAbrGovernor();
+                hls.startLevel = -1;
                 hls.loadLevel = -1;
             }
             return true;
         }
 
-        this.stopCustomAutoBitrate();
-        resetCustomAutoHlsBufferLimit(hls);
+        this.stopHlsAbrGovernor();
 
         const level = getManualHlsLevelForBitrate(hls.levels, options.maxBitrate);
         if (level === -1) {
             return false;
         }
 
+        hls.startLevel = level;
         hls.loadLevel = level;
         return true;
     }
@@ -2768,9 +2874,10 @@ export class HtmlVideoPlayer {
         if (mediaElement) {
             if (val != null) {
                 const time = Math.max(0, (val / 1000) - this.getPlaybackRuntimeTimeOffset());
-                this._customAutoBufferSeeking = true;
-                this._customAutoLastSeekTime = performance.now();
-                this._customAutoBufferSamples = [];
+                const nowMs = performance.now();
+                this._hlsAbrSeeking = false;
+                this._hlsAbrSeekGraceUntil = nowMs + HLS_ABR_SEEK_GRACE_MS;
+                this.resetHlsAbrGovernorForSeek(nowMs);
                 mediaElement.currentTime = time;
                 this.#currentTime = time;
                 Events.trigger(this, 'timeupdate', [{ isPositionChange: true }]);
@@ -3138,25 +3245,27 @@ export class HtmlVideoPlayer {
 
         if (this._hlsPlayer?.levels?.length) {
             const hls = this._hlsPlayer;
-            const level = this._customAutoBitrateEnabled
-                ? getCustomAutoControlledLevel(hls, this._customAutoBitrateControlledLevel)
-                : Math.max(hls.loadLevel, hls.currentLevel, hls.nextAutoLevel, 0);
+            const governor = this._hlsAbrGovernor;
+            const level = [hls.currentLevel, hls.loadLevel, hls.nextAutoLevel, hls.firstLevel, 0]
+                .find(levelIndex => Number.isInteger(levelIndex) && levelIndex >= 0);
             const bitrate = getHlsLevelBitrate(hls.levels[level]);
             const buffer = getHlsBufferedAhead(hls, mediaElement);
-            const now = performance.now();
-            const switchAge = this._customAutoBitrateLastSwitchTime
-                ? Math.round((now - this._customAutoBitrateLastSwitchTime) / 1000)
-                : 0;
-            const graceSeconds = this._customAutoBitrateLastSwitchDirection === 'up'
-                ? Math.max(0, Math.ceil((CUSTOM_AUTO_POST_UP_DOWN_GRACE_MS - (now - (this._customAutoBitrateLastSwitchTime || 0))) / 1000))
-                : 0;
-            const autoDetails = this._customAutoBitrateEnabled
-                ? ` / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / bufCap ${Math.round((this._customAutoBufferDetectedCap || 0) * 10) / 10}s / buf ${Math.round((this._customAutoBufferRatio || 0) * 100)}% / short ${Math.round((this._customAutoBufferShortTrend || 0) * 10) / 10}s/s / long ${Math.round((this._customAutoBufferLongTrend || 0) * 10) / 10}s/s / upTarget ${this._customAutoBitrateDesiredLevel ?? '?'} / downTarget ${this._customAutoBitrateDownLevel ?? '?'} / sw ${switchAge}s / grace ${graceSeconds}s / hlsCap ${Math.round((hls.maxBufferLength || 0) * 10) / 10}s / configCap ${Math.round(hls.config?.maxMaxBufferLength || 0)}s / bwe ${Math.round((this._customAutoBitrateBandwidthEstimate || 0) / 100000) / 10} Mbps / bwSamples ${this._customAutoBitrateBandwidthSampleCount || 0}`
-                : '';
+            const state = governor?.getState();
+            const probationProbePending = Number(Boolean(state?.probationProbePending));
+            const autoDetails = state ?
+                ` / phase ${state.phase} / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / cap ${state.capLevel} / hcap ${hls.autoLevelCapping} / maxAuto ${hls.maxAutoLevel} / hardCap ${state.hardCapLevel} / manual ${hls.manualLevel} / loaded ${state.lastLoadedLevel} / probe ${state.probationLevel} / pending ${probationProbePending} / restore ${state.restoreCapLevel} / upTarget ${state.upTargetLevel} / votes ${state.upVotes} / refill ${state.pendingRefillFragments}/${state.lastRefillCredits} / hold ${Math.round(state.upHoldRemainingSeconds * 10) / 10}s / recovery ${Math.round(state.recoveryRemainingSeconds * 10) / 10}s / buf ${Math.round(buffer * 10) / 10}s / maxBuf ${Math.round(hls.maxBufferLength * 10) / 10}/${Math.round(hls.config.maxMaxBufferLength * 10) / 10}s / bufferFull ${this._hlsAbrBufferFullCount || 0} / low ${Math.round(state.lowBufferSeconds * 10) / 10}s / high ${Math.round(state.highBufferSeconds * 10) / 10}s / slope ${Math.round(state.bufferSlope * 100) / 100}s/s / predictedLoad ${Math.round(state.predictedCurrentLoadSeconds * 10) / 10}s / bwe ${Math.round(state.bandwidthEstimate / 100000) / 10} Mbps / service ${Math.round(state.serviceBandwidthEstimate / 100000) / 10} Mbps / ttfb ${Math.round(state.ttfbEstimateMs)}ms / samples ${state.confidence}` :
+                '';
+            let autoMode = 'Manual';
+            if (governor) {
+                autoMode = 'Governor';
+            } else if (hls.autoLevelEnabled) {
+                autoMode = 'hls.js';
+            }
+            const bitrateText = bitrate ? `${Math.round(bitrate / 100000) / 10} Mbps` : 'unknown';
 
             mediaCategory.stats.push({
                 label: 'HLS Auto',
-                value: `${this._customAutoBitrateEnabled ? 'Custom' : hls.autoLevelEnabled ? 'hls.js' : 'Manual'} / ${level} / ${bitrate ? `${Math.round(bitrate / 100000) / 10} Mbps` : 'unknown'} / ${Math.round(buffer)}s${autoDetails}`
+                value: `${autoMode} / ${level} / ${bitrateText} / ${Math.round(buffer)}s${autoDetails}`
             });
         }
 

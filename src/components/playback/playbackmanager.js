@@ -32,6 +32,7 @@ import { ServerConnections } from 'lib/jellyfin-apiclient';
 import { MediaError } from 'types/mediaError';
 import { getMediaError } from 'utils/mediaError';
 import { toApi } from 'utils/jellyfin-apiclient/compat';
+import { getPlaybackBitrateSeed } from './playbackBitrate.ts';
 import { bindSkipSegment } from './skipsegment.ts';
 
 const UNLIMITED_ITEMS = -1;
@@ -71,6 +72,10 @@ function getAdaptiveBitrateManifestMaxBitrate(player, item, selectedBitrate) {
     }
 
     return Math.max(selectedBitrate || 0, VIDEO_QUALITY_BITRATES[0]);
+}
+
+function isCurrentPlaybackStream(playerData, streamInfo) {
+    return playerData.streamInfo === streamInfo && !streamInfo.ended;
 }
 
 function isClientRenderedPgsSubtitle(subtitleStream) {
@@ -1807,11 +1812,13 @@ export class PlaybackManager {
                 }
 
                 const maxBitrate = params.MaxStreamingBitrate || self.getMaxStreamingBitrate(player);
+                const supportsAdaptiveBitrate = player.supportsAdaptiveBitrate?.(currentItem);
+                const manifestMaxBitrate = getAdaptiveBitrateManifestMaxBitrate(player, currentItem, maxBitrate);
 
                 const currentPlayOptions = currentItem.playOptions || getDefaultPlayOptions();
 
                 const options = {
-                    maxBitrate,
+                    maxBitrate: manifestMaxBitrate,
                     startPosition: ticks,
                     isPlayback: true,
                     audioStreamIndex,
@@ -1830,6 +1837,14 @@ export class PlaybackManager {
                         streamInfo.fullscreen = currentPlayOptions.fullscreen;
                         streamInfo.lastMediaInfoQuery = lastMediaInfoQuery;
                         streamInfo.resetSubtitleOffset = false;
+
+                        const endpointInfo = apiClient.getSavedEndpointInfo() || {};
+                        Object.assign(streamInfo, getPlaybackBitrateSeed({
+                            apiClient,
+                            isAutomaticBitrateEnabled: appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, currentItem.MediaType),
+                            maxBitrate,
+                            supportsAdaptiveBitrate
+                        }));
 
                         if (!streamInfo.url) {
                             cancelPlayback();
@@ -1850,14 +1865,27 @@ export class PlaybackManager {
 
         function changeStreamToUrl(apiClient, player, playSessionId, streamInfo) {
             const playerData = getPlayerData(player);
+            const hadCurrentStream = Boolean(playerData.streamInfo);
+            if (playerData.streamInfo) {
+                playerData.streamInfo.ended = true;
+            }
+            playerData.streamInfo = streamInfo;
 
             playerData.isChangingStream = true;
 
-            if (playerData.streamInfo && playSessionId) {
-                apiClient.stopActiveEncodings(playSessionId).then(function () {
+            if (hadCurrentStream && playSessionId) {
+                apiClient.stopActiveEncodings(playSessionId).catch(() => {
+                    // A stale encoding must not prevent the requested stream from taking ownership.
+                }).then(function () {
+                    if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                        return;
+                    }
+
                     // Stop the first transcoding afterwards because the player may still send requests to the original url
                     const afterSetSrc = function () {
-                        apiClient.stopActiveEncodings(playSessionId);
+                        if (isCurrentPlaybackStream(playerData, streamInfo)) {
+                            apiClient.stopActiveEncodings(playSessionId);
+                        }
                     };
                     setSrcIntoPlayer(apiClient, player, streamInfo).then(afterSetSrc, afterSetSrc);
                 });
@@ -1868,16 +1896,23 @@ export class PlaybackManager {
 
         function setSrcIntoPlayer(apiClient, player, streamInfo) {
             const playerData = getPlayerData(player);
-
-            playerData.streamInfo = streamInfo;
+            if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                return Promise.resolve();
+            }
 
             return player.play(streamInfo).then(function () {
+                if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                    return;
+                }
                 playerData.isChangingStream = false;
                 streamInfo.started = true;
                 streamInfo.ended = false;
 
                 sendProgressUpdate(player, 'timeupdate');
             }, function (e) {
+                if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                    return;
+                }
                 playerData.isChangingStream = false;
 
                 onPlaybackError.call(player, e, {
@@ -2504,6 +2539,10 @@ export class PlaybackManager {
         }
 
         function destroyPlayer(player) {
+            const streamInfo = getPlayerData(player).streamInfo;
+            if (streamInfo) {
+                streamInfo.ended = true;
+            }
             player.destroy();
         }
 
@@ -2714,12 +2753,23 @@ export class PlaybackManager {
                 return promise.then(function () {
                     const streamInfo = createStreamInfoFromUrlItem(item);
                     streamInfo.fullscreen = playOptions.fullscreen;
-                    getPlayerData(player).isChangingStream = false;
+                    const playerData = getPlayerData(player);
+                    playerData.isChangingStream = false;
+                    if (playerData.streamInfo) {
+                        playerData.streamInfo.ended = true;
+                    }
+                    playerData.streamInfo = streamInfo;
                     return player.play(streamInfo).then(() => {
+                        if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                            return;
+                        }
                         loading.hide();
                         onPlaybackStartedFn();
                         onPlaybackStarted(player, playOptions, streamInfo);
                     }).catch((errorCode) => {
+                        if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                            return;
+                        }
                         self.stop(player);
                         loading.hide();
                         showPlaybackInfoErrorMessage(self, errorCode || 'ErrorDefault');
@@ -2745,9 +2795,9 @@ export class PlaybackManager {
                 const subtitleStreamIndex = playOptions.subtitleStreamIndex;
                 const supportsAdaptiveBitrate = player.supportsAdaptiveBitrate?.(item);
                 let clientRenderedSubtitleStreamIndex = supportsAdaptiveBitrate && subtitleStreamIndex != null
-                    && isClientRenderedPgsSubtitle(mediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === subtitleStreamIndex))
-                    ? subtitleStreamIndex
-                    : null;
+                    && isClientRenderedPgsSubtitle(mediaStreams.find(stream => stream.Type === 'Subtitle' && stream.Index === subtitleStreamIndex)) ?
+                    subtitleStreamIndex :
+                    null;
                 const manifestMaxBitrate = getAdaptiveBitrateManifestMaxBitrate(player, item, maxBitrate);
                 const options = {
                     aspectRatio: playOptions.aspectRatio,
@@ -2819,13 +2869,12 @@ export class PlaybackManager {
 
                     const streamInfo = createStreamInfo(apiClient, item.MediaType, item, mediaSource, startPosition, player);
                     const endpointInfo = apiClient.getSavedEndpointInfo() || {};
-                    if (appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType)) {
-                        if (!supportsAdaptiveBitrate) {
-                            streamInfo.initialBandwidthEstimate = maxBitrate;
-                        }
-                    } else {
-                        streamInfo.initialMaxStreamingBitrate = maxBitrate;
-                    }
+                    Object.assign(streamInfo, getPlaybackBitrateSeed({
+                        apiClient,
+                        isAutomaticBitrateEnabled: appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, item.MediaType),
+                        maxBitrate,
+                        supportsAdaptiveBitrate
+                    }));
                     streamInfo.aspectRatio = playOptions.aspectRatio;
                     streamInfo.fullscreen = playOptions.fullscreen;
 
@@ -2833,6 +2882,9 @@ export class PlaybackManager {
 
                     playerData.isChangingStream = false;
                     playerData.maxStreamingBitrate = supportsAdaptiveBitrate ? manifestMaxBitrate : maxBitrate;
+                    if (playerData.streamInfo) {
+                        playerData.streamInfo.ended = true;
+                    }
                     playerData.streamInfo = streamInfo;
 
                     const subtitleSummary = (mediaSource.MediaStreams || [])
@@ -2842,14 +2894,23 @@ export class PlaybackManager {
                     console.warn(`[PGS] playback mediaSource subtitle state: playOption=${subtitleStreamIndex ?? 'none'} clientHeld=${clientRenderedSubtitleStreamIndex ?? 'none'} default=${mediaSource.DefaultSubtitleStreamIndex ?? 'none'} request=${options.subtitleStreamIndex ?? 'none'} burn=${appSettings.get('subtitleburnin') || 'none'} render=${appSettings.get('subtitlerenderpgs') || 'false'} subtitles=[${subtitleSummary}]`);
 
                     return player.play(streamInfo).then(function () {
+                        if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                            return;
+                        }
                         loading.hide();
                         onPlaybackStartedFn();
                         onPlaybackStarted(player, playOptions, streamInfo, mediaSource);
                     }, function (err) {
+                        if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                            return;
+                        }
                         // TODO: Improve this because it will report playback start on a failure
                         onPlaybackStartedFn();
                         onPlaybackStarted(player, playOptions, streamInfo, mediaSource);
                         setTimeout(function () {
+                            if (!isCurrentPlaybackStream(playerData, streamInfo)) {
+                                return;
+                            }
                             onPlaybackError.call(player, err, {
                                 type: getMediaError(err),
                                 streamInfo
@@ -3563,8 +3624,9 @@ export class PlaybackManager {
 
         function onPlaybackStopped(e, displayErrorCode) {
             const player = this;
+            const playerData = getPlayerData(player);
 
-            if (getPlayerData(player).isChangingStream) {
+            if (playerData.isChangingStream) {
                 return;
             }
 
@@ -3572,7 +3634,7 @@ export class PlaybackManager {
 
             // User clicked stop or content ended
             const state = self.getPlayerState(player);
-            const data = getPlayerData(player);
+            const data = playerData;
             const streamInfo = data.streamInfo;
 
             const errorOccurred = displayErrorCode && typeof (displayErrorCode) === 'string';
@@ -3651,6 +3713,10 @@ export class PlaybackManager {
 
             stopPlaybackProgressTimer(activePlayer);
             unbindStopped(activePlayer);
+            const activeStreamInfo = getPlayerData(activePlayer).streamInfo;
+            if (activeStreamInfo) {
+                activeStreamInfo.ended = true;
+            }
 
             if (activePlayer === newPlayer) {
                 // If we're staying with the same player, stop it
@@ -4085,6 +4151,11 @@ export class PlaybackManager {
     stop(player) {
         player = player || this._currentPlayer;
         if (player) {
+            if (player.streamInfo) {
+                player.streamInfo.ended = true;
+            }
+            player.isChangingStream = false;
+
             if (enableLocalPlaylistManagement(player)) {
                 this._playNextAfterEnded = false;
             }
