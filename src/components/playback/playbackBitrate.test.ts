@@ -40,7 +40,7 @@ describe('getPlaybackBitrateSeed', () => {
             maxBitrate: 120_000_000,
             nowMs: NOW_MS,
             supportsAdaptiveBitrate: true
-        })).toEqual({ initialBandwidthEstimate: 20_000_000 });
+        })).toEqual({ initialSafeStreamingBitrate: 20_000_000 });
 
         expect(getPlaybackBitrateSeed({
             apiClient: {

@@ -16,6 +16,7 @@ interface PlaybackBitrateSeedOptions {
 interface PlaybackBitrateSeed {
     initialBandwidthEstimate?: number | null;
     initialMaxStreamingBitrate?: number | null;
+    initialSafeStreamingBitrate?: number | null;
 }
 
 export function getRecentDetectedBitrate(apiClient?: BitrateCache | null, nowMs = Date.now()) {
@@ -42,5 +43,5 @@ export function getPlaybackBitrateSeed(options: PlaybackBitrateSeedOptions): Pla
     }
 
     const detectedBitrate = getRecentDetectedBitrate(options.apiClient, options.nowMs);
-    return detectedBitrate ? { initialBandwidthEstimate: detectedBitrate } : {};
+    return detectedBitrate ? { initialSafeStreamingBitrate: detectedBitrate } : {};
 }

@@ -28,18 +28,23 @@ function createFragmentSample(options: {
     bandwidth?: number;
     durationSeconds?: number;
     level?: number;
+    mediaBitrate?: number;
     nowMs: number;
     ttfbMs?: number;
 }): HlsAbrFragmentSample {
     const bandwidth = options.bandwidth || 30_000_000;
-    const payloadDurationMs = 1_000;
+    const durationSeconds = options.durationSeconds || 3;
+    const level = options.level ?? 4;
+    const loadedBytes = options.mediaBitrate ?
+        options.mediaBitrate * durationSeconds / 8 :
+        bandwidth * 1_000 / 8_000;
+    const payloadDurationMs = loadedBytes * 8_000 / bandwidth;
     const ttfbMs = options.ttfbMs ?? 100;
-    const loadedBytes = bandwidth * payloadDurationMs / 8_000;
 
     return {
-        durationSeconds: options.durationSeconds || 3,
+        durationSeconds,
         isMain: true,
-        level: options.level ?? 4,
+        level,
         loadedBytes,
         loadingEndMs: options.nowMs,
         loadingFirstMs: options.nowMs - payloadDurationMs,
@@ -848,6 +853,43 @@ describe('HlsAbrGovernor upshifts', () => {
         expect(governor.getState()).toMatchObject({ capLevel: 4, probationLevel: -1 });
     });
 
+    it('expires a pending probe when no other fragments complete', () => {
+        const governor = createGovernor();
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 1_000 }));
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 2_000 }));
+        governor.observe(createSnapshot({ bufferSeconds: 14, currentLevel: 4, nowMs: 12_000 }));
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 13_000 }));
+        expect(governor.observe(createSnapshot({ bufferSeconds: 15, currentLevel: 4, nowMs: 13_000 })))
+            .toMatchObject({ capLevel: 5, probeLevel: 5 });
+
+        expect(governor.observe(createSnapshot({ bufferSeconds: 15, currentLevel: 4, nowMs: 23_001 })))
+            .toMatchObject({
+                capLevel: 4,
+                forceLevel: 4,
+                phase: 'steady',
+                reason: 'probe-start-timeout'
+            });
+    });
+
+    it('expires probation when a started probe never completes', () => {
+        const governor = createGovernor();
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 1_000 }));
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 2_000 }));
+        governor.observe(createSnapshot({ bufferSeconds: 14, currentLevel: 4, nowMs: 12_000 }));
+        governor.recordFragment(createFragmentSample({ level: 4, nowMs: 13_000 }));
+        expect(governor.observe(createSnapshot({ bufferSeconds: 15, currentLevel: 4, nowMs: 13_000 })))
+            .toMatchObject({ capLevel: 5, probeLevel: 5 });
+        expect(governor.confirmProbe(5, 14_000)).toBe(true);
+
+        expect(governor.observe(createSnapshot({ bufferSeconds: 15, currentLevel: 4, nowMs: 34_001 })))
+            .toMatchObject({
+                capLevel: 4,
+                forceLevel: 4,
+                phase: 'steady',
+                reason: 'probation-timeout'
+            });
+    });
+
     it('rolls back immediately when the player rejects a requested probe', () => {
         const governor = createGovernor();
         governor.recordFragment(createFragmentSample({ level: 4, nowMs: 1_000 }));
@@ -1027,6 +1069,29 @@ describe('HlsAbrGovernor upshifts', () => {
 
         expect(decision).toBeNull();
         expect(governor.getState().capLevel).toBe(4);
+    });
+
+    it('uses observed VBR media rate when deciding whether the current level is safe', () => {
+        const governor = createGovernor();
+        governor.recordFragment(createFragmentSample({
+            bandwidth: 10_000_000,
+            level: 4,
+            mediaBitrate: 9_000_000,
+            nowMs: 3_000
+        }));
+
+        const decision = governor.observe(createSnapshot({
+            bufferSeconds: 2,
+            currentLevel: 4,
+            hlsBandwidthEstimate: 10_000_000,
+            nowMs: 4_000
+        }));
+
+        expect(decision).toMatchObject({
+            capLevel: 3,
+            forceLevel: 3,
+            reason: 'critical-buffer'
+        });
     });
 
     it('lets a floor emergency cancel an active upward probe', () => {

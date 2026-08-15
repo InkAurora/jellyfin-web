@@ -16,6 +16,8 @@ const PREVENTIVE_DOWN_VOTES = 2;
 const PROBATION_TARGET_FRAGMENTS = 2;
 const PROBATION_MAX_FRAGMENTS = 4;
 const PROBE_START_MAX_FRAGMENTS = 2;
+const PROBE_START_MIN_TIMEOUT_MS = 10_000;
+const PROBATION_MIN_TIMEOUT_MS = 20_000;
 const REFILL_EVIDENCE_MIN_MAX_AGE_MS = 5_000;
 const REFILL_EVIDENCE_MAX_AGE_SEGMENTS = 2;
 const REFILL_VISIBLE_DELTA_FRACTION = 0.5;
@@ -100,8 +102,8 @@ export interface HlsAbrState {
 }
 
 interface BandwidthSample {
-    level: number;
-    mediaDurationSeconds: number;
+    levelBitrate: number;
+    mediaRate: number;
     nowMs: number;
     payloadRate: number;
     serviceRate: number;
@@ -247,6 +249,8 @@ export class HlsAbrGovernor {
     private probationLevel = -1;
     private probationProbePending = false;
     private probationRaisedCap = false;
+    private probationProbeRequestedAt = 0;
+    private probationStartedAt = 0;
     private probationStartFragmentCount = 0;
     private probationTargetFragments = 0;
     private probationValidationProbeIssued = false;
@@ -333,6 +337,7 @@ export class HlsAbrGovernor {
         const loadedBits = sample.loadedBytes * 8;
         const payloadRate = (loadedBits * 1000) / payloadDurationMs;
         const serviceRate = (loadedBits * 1000) / serviceDurationMs;
+        const mediaRate = loadedBits / sample.durationSeconds;
         const ttfbMs = Math.max(sample.loadingFirstMs - sample.loadingStartMs, 0);
         const weightSeconds = clamp(serviceDurationMs / 1000, 0.05, 5);
 
@@ -349,8 +354,8 @@ export class HlsAbrGovernor {
             SLOW_EWMA_HALF_LIFE_SECONDS
         );
         this.bandwidthSamples.push({
-            level: sample.level,
-            mediaDurationSeconds: sample.durationSeconds,
+            levelBitrate: this.getBitrate(sample.level),
+            mediaRate,
             nowMs: sample.nowMs,
             payloadRate,
             serviceRate,
@@ -362,7 +367,7 @@ export class HlsAbrGovernor {
         if (this.phase === 'probation'
             && this.probationProbePending
             && this.lastLoadedLevel >= this.probationLevel) {
-            this.confirmProbe(this.lastLoadedLevel);
+            this.confirmProbe(this.lastLoadedLevel, sample.nowMs);
         }
         if (this.phase === 'probation'
             && !this.probationProbePending
@@ -455,7 +460,7 @@ export class HlsAbrGovernor {
         );
     }
 
-    confirmProbe(level: number) {
+    confirmProbe(level: number, nowMs = this.lastSnapshot?.nowMs ?? this.lastSampleAt) {
         if (this.phase !== 'probation'
             || !this.probationProbePending
             || level < this.probationLevel) {
@@ -463,7 +468,11 @@ export class HlsAbrGovernor {
         }
 
         this.probationProbePending = false;
+        this.probationProbeRequestedAt = 0;
         this.probationStartFragmentCount = this.fragmentCount;
+        if (this.probationStartedAt === 0 || this.probationTargetFragments === 0) {
+            this.probationStartedAt = nowMs;
+        }
         return true;
     }
 
@@ -603,6 +612,7 @@ export class HlsAbrGovernor {
             && !sample.aborted
             && Number.isInteger(sample.level)
             && sample.level >= 0
+            && Number.isFinite(sample.loadedBytes)
             && sample.loadedBytes >= 32 * 1024
             && isPositiveFinite(sample.durationSeconds)
             && sample.loadingFirstMs >= sample.loadingStartMs
@@ -734,19 +744,26 @@ export class HlsAbrGovernor {
         }
 
         if (this.probationProbePending) {
-            return this.evaluatePendingProbe(snapshot.nowMs);
+            return this.evaluatePendingProbe(snapshot);
         }
 
         if (this.shouldIssueProbationValidationProbe(hasNewFragment)) {
             this.probationValidationProbeIssued = true;
             this.probationProbePending = true;
+            this.probationProbeRequestedAt = snapshot.nowMs;
             this.probationStartFragmentCount = this.fragmentCount;
             const decision = this.createDecision('probation-validation-probe');
             decision.probeLevel = this.probationLevel;
             return decision;
         }
 
-        if (this.fragmentCount - this.probationStartFragmentCount >= PROBATION_MAX_FRAGMENTS) {
+        const probationTimeoutMs = Math.max(
+            PROBATION_MIN_TIMEOUT_MS,
+            snapshot.segmentDurationSeconds * PROBATION_MAX_FRAGMENTS * 1_000
+        );
+        if (this.fragmentCount - this.probationStartFragmentCount >= PROBATION_MAX_FRAGMENTS
+            || (this.probationStartedAt > 0
+                && snapshot.nowMs - this.probationStartedAt > probationTimeoutMs)) {
             return this.timeoutProbation(currentLevel, snapshot.nowMs);
         }
 
@@ -772,9 +789,15 @@ export class HlsAbrGovernor {
         this.phase = this.isRestoringCap() ? 'startup' : 'steady';
     }
 
-    private evaluatePendingProbe(nowMs: number) {
-        if (this.fragmentCount - this.probationStartFragmentCount >= PROBE_START_MAX_FRAGMENTS) {
-            return this.rejectProbe(this.probationLevel, nowMs, 'probe-start-timeout');
+    private evaluatePendingProbe(snapshot: HlsAbrSnapshot) {
+        const probeStartTimeoutMs = Math.max(
+            PROBE_START_MIN_TIMEOUT_MS,
+            snapshot.segmentDurationSeconds * PROBE_START_MAX_FRAGMENTS * 1_000
+        );
+        if (this.fragmentCount - this.probationStartFragmentCount >= PROBE_START_MAX_FRAGMENTS
+            || (this.probationProbeRequestedAt > 0
+                && snapshot.nowMs - this.probationProbeRequestedAt > probeStartTimeoutMs)) {
+            return this.rejectProbe(this.probationLevel, snapshot.nowMs, 'probe-start-timeout');
         }
         return null;
     }
@@ -789,7 +812,13 @@ export class HlsAbrGovernor {
         this.upVotes = 0;
         this.upTargetLevel = this.lastLoadedLevel >= 0 ? this.lastLoadedLevel : currentLevel;
         this.clearProbation();
-        return shouldRestoreCap ? this.createDecision('probation-timeout') : null;
+        if (!shouldRestoreCap) {
+            return null;
+        }
+
+        const decision = this.createDecision('probation-timeout');
+        decision.forceLevel = Math.min(currentLevel, this.policyCapLevel);
+        return decision;
     }
 
     private evaluateBufferPressure(
@@ -914,7 +943,7 @@ export class HlsAbrGovernor {
             return null;
         }
 
-        return this.beginUpshiftProbation(target);
+        return this.beginUpshiftProbation(target, snapshot.nowMs);
     }
 
     private shouldResetUncorrelatedRefillEvidence(
@@ -1151,7 +1180,7 @@ export class HlsAbrGovernor {
         return null;
     }
 
-    private beginUpshiftProbation(target: number) {
+    private beginUpshiftProbation(target: number, nowMs: number) {
         this.clearPendingRefillEvidence();
         this.previousCapLevel = this.policyCapLevel;
         const raisedCap = target > this.policyCapLevel;
@@ -1161,7 +1190,9 @@ export class HlsAbrGovernor {
         this.phase = 'probation';
         this.probationLevel = target;
         this.probationProbePending = true;
+        this.probationProbeRequestedAt = nowMs;
         this.probationRaisedCap = raisedCap;
+        this.probationStartedAt = nowMs;
         this.probationStartFragmentCount = this.fragmentCount;
         this.probationTargetFragments = 0;
         this.probationValidationProbeIssued = false;
@@ -1319,7 +1350,7 @@ export class HlsAbrGovernor {
         factor: number,
         useUpCapacity: boolean
     ) {
-        const bitrate = this.getBitrate(levelIndex);
+        const bitrate = this.getEffectiveBitrate(levelIndex);
         const capacity = useUpCapacity ? estimator.upCapacity : estimator.downCapacity;
         if (!isPositiveFinite(bitrate) || !isPositiveFinite(capacity)) {
             return false;
@@ -1339,7 +1370,7 @@ export class HlsAbrGovernor {
     }
 
     private predictLoadSeconds(levelIndex: number, segmentDuration: number, capacity: number, ttfbMs: number) {
-        const bitrate = this.getBitrate(levelIndex);
+        const bitrate = this.getEffectiveBitrate(levelIndex);
         if (!isPositiveFinite(bitrate) || !isPositiveFinite(capacity)) {
             return 0;
         }
@@ -1371,7 +1402,7 @@ export class HlsAbrGovernor {
             return null;
         }
 
-        const currentBitrate = this.getBitrate(currentLevel);
+        const currentBitrate = this.getEffectiveBitrate(currentLevel);
         for (let position = currentPosition - 1; position >= 0; position--) {
             const candidate = this.levels[position];
             if (candidate.index > maximumTarget || candidate.index > this.hardCapLevel) {
@@ -1422,7 +1453,9 @@ export class HlsAbrGovernor {
     private clearProbation() {
         this.probationLevel = -1;
         this.probationProbePending = false;
+        this.probationProbeRequestedAt = 0;
         this.probationRaisedCap = false;
+        this.probationStartedAt = 0;
         this.probationStartFragmentCount = 0;
         this.probationTargetFragments = 0;
         this.probationValidationProbeIssued = false;
@@ -1465,6 +1498,21 @@ export class HlsAbrGovernor {
 
     private getBitrate(levelIndex: number) {
         return this.levels.find(level => level.index === levelIndex)?.bitrate || 0;
+    }
+
+    private getEffectiveBitrate(levelIndex: number) {
+        const declaredBitrate = this.getBitrate(levelIndex);
+        if (!isPositiveFinite(declaredBitrate)) {
+            return 0;
+        }
+
+        const observedMediaRates = this.bandwidthSamples
+            .filter(sample => sample.levelBitrate === declaredBitrate)
+            .map(sample => sample.mediaRate)
+            .filter(isPositiveFinite);
+        return observedMediaRates.length ?
+            Math.max(declaredBitrate, ...observedMediaRates) :
+            declaredBitrate;
     }
 
     private createDecision(reason: string): HlsAbrDecision {

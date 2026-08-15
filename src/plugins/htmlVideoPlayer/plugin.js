@@ -46,7 +46,11 @@ import Events from '../../utils/events.ts';
 import { includesAny } from '../../utils/container.ts';
 import { isHls } from '../../utils/mediaSource.ts';
 import { HlsAbrGovernor } from './hlsAbrGovernor.ts';
-import { getHlsAbrPlatformOptions } from './hlsAbrOptions.ts';
+import {
+    getHlsAbrGovernorSeed,
+    getHlsAbrPlatformOptions,
+    getHlsAdaptiveBufferOptions
+} from './hlsAbrOptions.ts';
 
 /**
  * Returns resolved URL.
@@ -227,8 +231,6 @@ function getManualHlsLevelForBitrate(levels, maxBitrate) {
 }
 
 const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
-const CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH = 60;
-const CUSTOM_ABR_HLS_MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
 const CUSTOM_AUTO_INITIAL_BITRATE = 6000000;
 const HLS_ABR_GOVERNOR_TICK_MS = 2000;
@@ -239,7 +241,10 @@ function getHlsAbrOptions(options) {
         return {};
     }
 
-    const initialBandwidthEstimate = parseInt(options.initialBandwidthEstimate, 10);
+    const initialBandwidthEstimate = parseInt(
+        options.initialBandwidthEstimate ?? options.initialSafeStreamingBitrate,
+        10
+    );
     const abrOptions = {
         autoStartLoad: false,
         ...getHlsAbrPlatformOptions({
@@ -272,23 +277,18 @@ function getHlsAbrOptions(options) {
 
 function getHlsBufferOptions(player, options) {
     const savedBufferLength = userSettings.hlsForwardBufferLength();
-    if (savedBufferLength > 0) {
-        const bufferLength = options.adaptiveBitrateStreaming ? Math.max(savedBufferLength, CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH) : savedBufferLength;
-
-        return {
-            maxBufferLength: bufferLength,
-            maxMaxBufferLength: bufferLength,
-            ...(options.adaptiveBitrateStreaming ? { maxBufferSize: CUSTOM_ABR_HLS_MAX_BUFFER_SIZE } : {}),
-            backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
-            liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
-        };
+    if (options.adaptiveBitrateStreaming) {
+        return getHlsAdaptiveBufferOptions({
+            isHighBitrateBrowser: browser.chrome || browser.edgeChromium || browser.firefox,
+            maximumBitrate: 0,
+            savedBufferLength
+        });
     }
 
-    if (options.adaptiveBitrateStreaming) {
+    if (savedBufferLength > 0) {
         return {
-            maxBufferLength: CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH,
-            maxMaxBufferLength: CUSTOM_ABR_HLS_MAX_BUFFER_LENGTH,
-            maxBufferSize: CUSTOM_ABR_HLS_MAX_BUFFER_SIZE,
+            maxBufferLength: savedBufferLength,
+            maxMaxBufferLength: savedBufferLength,
             backBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH,
             liveBackBufferLength: CUSTOM_HLS_BACK_BUFFER_LENGTH
         };
@@ -309,6 +309,19 @@ function getHlsBufferOptions(player, options) {
         maxBufferLength: 30,
         maxMaxBufferLength: 30
     };
+}
+
+function updateHlsAdaptiveBufferOptions(hls, maximumPlaybackBitrate) {
+    const manifestMaximumBitrate = Math.max(0, ...hls.levels.map(getHlsLevelBitrate));
+    const parsedMaximumPlaybackBitrate = Number.parseInt(maximumPlaybackBitrate, 10);
+    const maximumBitrate = Number.isFinite(parsedMaximumPlaybackBitrate) && parsedMaximumPlaybackBitrate > 0 ?
+        Math.min(manifestMaximumBitrate, parsedMaximumPlaybackBitrate) :
+        manifestMaximumBitrate;
+    Object.assign(hls.config, getHlsAdaptiveBufferOptions({
+        isHighBitrateBrowser: browser.chrome || browser.edgeChromium || browser.firefox,
+        maximumBitrate,
+        savedBufferLength: userSettings.hlsForwardBufferLength()
+    }));
 }
 
 function useHlsAbrGovernor(options) {
@@ -732,20 +745,21 @@ export class HtmlVideoPlayer {
         this.stopHlsAbrGovernor();
 
         const nowMs = performance.now();
-        const configuredBandwidthEstimate = Number.parseInt(this._currentPlayOptions?.initialBandwidthEstimate, 10);
-        const initialBandwidthEstimate = Number.isFinite(bandwidthEstimate) && bandwidthEstimate > 0 ?
-            bandwidthEstimate :
-            configuredBandwidthEstimate;
+        const configuredSafeBitrate = Number.parseInt(
+            this._currentPlayOptions?.initialSafeStreamingBitrate,
+            10
+        );
         const governor = new HlsAbrGovernor({
             levels: hls.levels.map((level, index) => ({
                 index,
                 bitrate: getHlsLevelBitrate(level)
             })),
             nowMs,
-            initialBandwidthEstimate: Number.isFinite(initialBandwidthEstimate) && initialBandwidthEstimate > 0 ?
-                initialBandwidthEstimate :
-                undefined,
-            initialBitrate: CUSTOM_AUTO_INITIAL_BITRATE,
+            ...getHlsAbrGovernorSeed({
+                configuredSafeBitrate,
+                fallbackBitrate: CUSTOM_AUTO_INITIAL_BITRATE,
+                learnedBandwidthEstimate: bandwidthEstimate
+            }),
             configuredBufferCapSeconds: getHlsForwardBufferCap(hls)
         });
 
@@ -928,7 +942,7 @@ export class HtmlVideoPlayer {
                 state?.lastLoadedLevel;
             if (Number.isInteger(activeLevel)
                 && activeLevel >= probeLevel
-                && this._hlsAbrGovernor?.confirmProbe(activeLevel)) {
+                && this._hlsAbrGovernor?.confirmProbe(activeLevel, performance.now())) {
                 appliedProbeLevel = activeLevel;
             } else if (canApplyHlsAbrProbe(hls, probeLevel, activeLevel)) {
                 hls.nextAutoLevel = probeLevel;
@@ -1185,6 +1199,10 @@ export class HtmlVideoPlayer {
                         return;
                     }
 
+                    if (options.adaptiveBitrateStreaming) {
+                        updateHlsAdaptiveBufferOptions(hls, options.initialMaxStreamingBitrate);
+                    }
+
                     if (options.initialMaxStreamingBitrate) {
                         const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
                         if (level !== -1) {
@@ -1212,7 +1230,7 @@ export class HtmlVideoPlayer {
                             this._hlsAbrActiveLoadToken = loadToken;
                             this._hlsAbrActiveMainLevel = level;
                             if (level === this._hlsAbrPendingProbeLevel
-                                && this._hlsAbrGovernor.confirmProbe(level)) {
+                                && this._hlsAbrGovernor.confirmProbe(level, performance.now())) {
                                 this._hlsAbrPendingProbeLevel = undefined;
                             }
                         }
@@ -2769,7 +2787,8 @@ export class HtmlVideoPlayer {
 
         if (options.enableAutomaticBitrateDetection || !options.maxBitrate) {
             if (useHlsAbrGovernor(this._currentPlayOptions || {})) {
-                if (!this.startHlsAbrGovernor()) {
+                updateHlsAdaptiveBufferOptions(hls);
+                if (!this.startHlsAbrGovernor(hls.bandwidthEstimate)) {
                     hls.startLevel = -1;
                     hls.loadLevel = -1;
                 }
@@ -2790,6 +2809,9 @@ export class HtmlVideoPlayer {
 
         hls.startLevel = level;
         hls.loadLevel = level;
+        if (useHlsAbrGovernor(this._currentPlayOptions || {})) {
+            updateHlsAdaptiveBufferOptions(hls, getHlsLevelBitrate(hls.levels[level]));
+        }
         return true;
     }
 
