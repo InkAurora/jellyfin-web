@@ -46,6 +46,7 @@ import Events from '../../utils/events.ts';
 import { includesAny } from '../../utils/container.ts';
 import { isHls } from '../../utils/mediaSource.ts';
 import { HlsAbrGovernor } from './hlsAbrGovernor.ts';
+import AutoAspectRatio from './autoAspectRatio.ts';
 import {
     getHlsAbrGovernorSeed,
     getHlsAbrPlatformOptions,
@@ -545,6 +546,7 @@ export class HtmlVideoPlayer {
      * @type {HTMLVideoElement | null | undefined}
      */
     #mediaElement;
+    #autoAspectRatio;
     /**
      * @type {number}
      */
@@ -1046,6 +1048,16 @@ export class HtmlVideoPlayer {
     }
 
     async play(options) {
+        // Stream restarts for seeks, audio or quality changes are still the same playback.
+        const previousOptions = this._currentPlayOptions;
+        if (options.item?.Id && options.item.Id === previousOptions?.item?.Id
+            && options.item.ServerId === previousOptions.item.ServerId
+            && options.mediaSource?.Id === previousOptions.mediaSource?.Id) {
+            this.#autoAspectRatio?.suspend();
+        } else {
+            this.#autoAspectRatio?.destroy();
+            this.#autoAspectRatio = null;
+        }
         const sourceGeneration = ++this._hlsSourceGeneration;
         this.#started = false;
         this.#timeUpdated = false;
@@ -1739,6 +1751,8 @@ export class HtmlVideoPlayer {
     }
 
     stop(destroyPlayer) {
+        this.#autoAspectRatio?.destroy();
+        this.#autoAspectRatio = null;
         const elem = this.#mediaElement;
         const src = this.#currentSrc;
 
@@ -1764,6 +1778,8 @@ export class HtmlVideoPlayer {
     }
 
     destroy() {
+        this.#autoAspectRatio?.destroy();
+        this.#autoAspectRatio = null;
         this.setSubtitleOffset.cancel();
 
         this._hlsSourceGeneration++;
@@ -1826,6 +1842,8 @@ export class HtmlVideoPlayer {
             return;
         }
 
+        this.#autoAspectRatio?.destroy();
+        this.#autoAspectRatio = null;
         this._hlsSourceGeneration++;
         this._activeSourceGeneration = undefined;
         this.stopHlsAbrGovernor();
@@ -1928,6 +1946,8 @@ export class HtmlVideoPlayer {
 
         if (!this.#started) {
             this.#started = true;
+            this.#applyAspectRatio(this._currentPlayOptions?.aspectRatio || this.getAspectRatio());
+            this.#autoAspectRatio?.resume();
             elem.removeAttribute('controls');
 
             loading.hide();
@@ -2359,7 +2379,7 @@ export class HtmlVideoPlayer {
             return 'contain';
         }
 
-        return aspectRatio === 'auto' ? 'contain' : aspectRatio;
+        return aspectRatio === 'auto' || aspectRatio === 'auto-dynamic' ? 'contain' : aspectRatio;
     }
 
     /**
@@ -2459,7 +2479,9 @@ export class HtmlVideoPlayer {
                 return;
             }
 
-            if (useCustomSubtitles(userSettings)) {
+            const aspectRatio = this._currentPlayOptions?.aspectRatio || this.getAspectRatio();
+            if (useCustomSubtitles(userSettings) || aspectRatio === 'auto' || aspectRatio === 'auto-dynamic') {
+                // Native cues are part of the video element and would be zoomed off-screen.
                 this.renderSubtitlesWithCustomElement(videoElement, track, item, targetTextTrackIndex);
                 return;
             }
@@ -3174,11 +3196,15 @@ export class HtmlVideoPlayer {
     #applyAspectRatio(val = this.getAspectRatio()) {
         const mediaElement = this.#mediaElement;
         if (mediaElement) {
-            if (val === 'auto') {
+            if (val === 'auto' || val === 'auto-dynamic') {
                 mediaElement.style.removeProperty('object-fit');
             } else {
                 mediaElement.style['object-fit'] = val;
             }
+            if (this.#started && !this.#autoAspectRatio) {
+                this.#autoAspectRatio = new AutoAspectRatio(mediaElement);
+            }
+            this.#autoAspectRatio?.setMode(val);
         }
 
         if (this.#currentPgsRenderer) {
@@ -3188,7 +3214,22 @@ export class HtmlVideoPlayer {
 
     setAspectRatio(val) {
         appSettings.aspectRatio(val);
+        if (this._currentPlayOptions) this._currentPlayOptions.aspectRatio = val;
         this.#applyAspectRatio(val);
+
+        // Move already-active native text cues to the separate layer when enabling automatic zoom.
+        if ((val === 'auto' || val === 'auto-dynamic') && this.#mediaElement && this._currentPlayOptions) {
+            const nativeTracks = Array.from(this.#mediaElement.textTracks).filter(isManualTextTrack);
+            const streamIndices = [this.#customTrackIndex, this.#customSecondaryTrackIndex];
+            streamIndices.forEach((streamIndex, index) => {
+                if (nativeTracks[index]?.mode !== 'showing') return;
+                const track = getMediaStreamTextTracks(this._currentPlayOptions.mediaSource)
+                    .find(stream => stream.Index === streamIndex);
+                if (!track || (itemHelper.isLocalItem(this._currentPlayOptions.item) && !track.IsExternal)) return;
+                this.destroyNativeTracks(this.#mediaElement, index);
+                this.renderSubtitlesWithCustomElement(this.#mediaElement, track, this._currentPlayOptions.item, index);
+            });
+        }
     }
 
     getAspectRatio() {
@@ -3199,6 +3240,9 @@ export class HtmlVideoPlayer {
         return [{
             name: globalize.translate('Auto'),
             id: 'auto'
+        }, {
+            name: globalize.translate('AspectRatioAutoDynamic'),
+            id: 'auto-dynamic'
         }, {
             name: globalize.translate('AspectRatioCover'),
             id: 'cover'
