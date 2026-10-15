@@ -5,6 +5,7 @@ import { AbrEstimator, type AbrFragmentSample } from './abrEstimator';
 const SEED_THROUGHPUT = 8_000_000;
 
 const tuning = {
+    defaultSwitchCostMs: 1_000,
     fastHalfLifeSeconds: 3,
     maxVbrRatio: 1.5,
     slowHalfLifeSeconds: 10
@@ -333,5 +334,50 @@ describe('AbrEstimator fetch time prediction', () => {
         const estimator = createEstimator();
 
         expect(estimator.predictFetchSeconds(0, 3)).toBe(Number.POSITIVE_INFINITY);
+    });
+});
+
+describe('AbrEstimator switch cost', () => {
+    it('uses the default switch cost before a switch was measured', () => {
+        expect(createEstimator().switchCostMs).toBe(1_000);
+    });
+
+    it('counts the full TTFB of the first fragment when there is no normal TTFB yet', () => {
+        const estimator = createEstimator();
+
+        estimator.record(createFragmentSample({ isFirstAfterSwitch: true, ttfbMs: 5_000 }));
+
+        expect(estimator.switchCostMs).toBe(5_000);
+    });
+
+    it('measures the extra TTFB of the first fragment after a switch', () => {
+        const estimator = createEstimator();
+        for (let index = 0; index < 4; index++) {
+            estimator.record(createFragmentSample({ ttfbMs: 100 }));
+        }
+
+        estimator.record(createFragmentSample({ isFirstAfterSwitch: true, ttfbMs: 4_100 }));
+
+        expect(estimator.switchCostMs).toBe(4_000);
+        expect(estimator.ttfbMs).toBe(100);
+    });
+
+    it('smooths later measurements', () => {
+        const estimator = createEstimator();
+        estimator.record(createFragmentSample({ ttfbMs: 100 }));
+        estimator.record(createFragmentSample({ isFirstAfterSwitch: true, ttfbMs: 4_100 }));
+
+        estimator.record(createFragmentSample({ isFirstAfterSwitch: true, ttfbMs: 2_100 }));
+
+        expect(estimator.switchCostMs).toBe(3_000);
+    });
+
+    it('never gives a negative switch cost', () => {
+        const estimator = createEstimator();
+        estimator.record(createFragmentSample({ ttfbMs: 300 }));
+
+        estimator.record(createFragmentSample({ isFirstAfterSwitch: true, ttfbMs: 50 }));
+
+        expect(estimator.switchCostMs).toBe(0);
     });
 });

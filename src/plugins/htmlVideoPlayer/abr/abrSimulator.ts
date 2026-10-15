@@ -39,6 +39,11 @@ export interface SimFragment {
 
 export interface SimAlgorithm {
     readonly name: string;
+    /**
+     * Return false to skip the hls.js emergency rule now. `isRestartWait` is
+     * true while the first fragment after a switch waits for its first byte.
+     */
+    allowEmergencyAbort?(isRestartWait: boolean, context: SimContext): boolean;
     /** The forward buffer limit the player uses at this level. */
     getBufferCapSeconds(levelBitrate: number, context: SimContext): number;
     chooseLevel(context: SimContext): number;
@@ -291,7 +296,11 @@ export function runSimulation(scenario: SimScenario, algorithm: SimAlgorithm): S
 
     // Close to hls.js AbrController._abandonRulesCheck.
     function checkAbandon(active: ActiveLoad) {
-        if (playState !== 'playing' || active.level === 0) {
+        if (playState !== 'playing' || active.level === 0
+            || algorithm.allowEmergencyAbort?.(
+                active.isFirstAfterSwitch && nowMs < active.firstByteAtMs,
+                context()
+            ) === false) {
             return;
         }
 

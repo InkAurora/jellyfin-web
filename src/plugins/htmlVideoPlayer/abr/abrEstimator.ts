@@ -4,8 +4,11 @@ const TTFB_WINDOW_SIZE = 8;
 const TTFB_PERCENTILE = 0.75;
 const VBR_SMOOTHING = 0.2;
 const MIN_VBR_RATIO = 1;
+const SWITCH_COST_SMOOTHING = 0.5;
 
 export interface AbrEstimatorTuning {
+    /** The switch cost to assume before the first switch was measured. */
+    defaultSwitchCostMs: number;
     fastHalfLifeSeconds: number;
     maxVbrRatio: number;
     slowHalfLifeSeconds: number;
@@ -57,6 +60,7 @@ export class AbrEstimator {
     private ttfbSamples: number[] = [];
     private vbrRatio = MIN_VBR_RATIO;
     private sampleCount = 0;
+    private switchCost = -1;
 
     constructor(seedThroughput: number, private tuning: AbrEstimatorTuning) {
         this.seedThroughput = isPositiveFinite(seedThroughput) ? seedThroughput : 0;
@@ -82,6 +86,14 @@ export class AbrEstimator {
         return this.sampleCount;
     }
 
+    /**
+     * The extra wait for the first fragment after a level switch or a seek.
+     * Jellyfin restarts the transcoder then, so this can be several seconds.
+     */
+    get switchCostMs() {
+        return this.switchCost >= 0 ? this.switchCost : this.tuning.defaultSwitchCostMs;
+    }
+
     record(sample: AbrFragmentSample) {
         const payloadMs = sample.loadingEndMs - sample.loadingFirstMs;
         const ttfbMs = sample.loadingFirstMs - sample.loadingStartMs;
@@ -103,7 +115,12 @@ export class AbrEstimator {
         this.slowThroughput = updateEwma(this.slowThroughput, payloadRate, weightSeconds, this.tuning.slowHalfLifeSeconds);
         this.sampleCount += 1;
 
-        if (!sample.isFirstAfterSwitch) {
+        if (sample.isFirstAfterSwitch) {
+            const cost = Math.max(ttfbMs - this.ttfbMs, 0);
+            this.switchCost = this.switchCost >= 0 ?
+                (SWITCH_COST_SMOOTHING * cost) + ((1 - SWITCH_COST_SMOOTHING) * this.switchCost) :
+                cost;
+        } else {
             this.ttfbSamples.push(ttfbMs);
             if (this.ttfbSamples.length > TTFB_WINDOW_SIZE) {
                 this.ttfbSamples.shift();

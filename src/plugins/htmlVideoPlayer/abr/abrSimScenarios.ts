@@ -7,6 +7,11 @@ import type { SimAlgorithm, SimContext, SimScenario } from './abrSimulator';
 
 export const LADDER = [420_000, 720_000, 1_500_000, 3_000_000, 6_000_000, 10_000_000, 20_000_000];
 export const HIGH_LADDER = [1_500_000, 3_000_000, 6_000_000, 10_000_000, 20_000_000, 40_000_000];
+/** A dense Jellyfin-like ladder: 15 levels from 0.4 Mbps, top above 25 Mbps. */
+export const DENSE_LADDER = [
+    400_000, 700_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000, 6_000_000,
+    8_000_000, 10_000_000, 12_000_000, 15_000_000, 20_000_000, 25_000_000, 30_000_000
+];
 export const MBPS = 1_000_000;
 
 export interface ScenarioCase {
@@ -44,6 +49,10 @@ export function createPolicyAlgorithm(options: {
     return {
         name: 'new',
         policy,
+        allowEmergencyAbort(isRestartWait) {
+            // Same as JellyfinAbrController: the restart wait is not a reason to abort.
+            return !isRestartWait;
+        },
         getBufferCapSeconds(levelBitrate) {
             return getHlsAdaptiveBufferOptions({
                 isHighBitrateBrowser: Boolean(options.highBitrateBrowser),
@@ -190,6 +199,19 @@ export function createCases(segmentDurationSeconds: number): Record<string, Scen
                 name: 'late buffer',
                 bandwidth: seconds => (Math.floor(seconds / 30) % 2 === 0 ? 25 : 6) * MBPS,
                 bufferReportDelayMs: 2_000
+            }
+        },
+        // A slow server: a 5K source transcodes at about 1.25x, so segments come
+        // just in time, and each level switch restarts the transcoder for 4 s.
+        '16 slow server, costly switch': {
+            highBitrateBrowser: true,
+            scenario: {
+                ...base,
+                levels: DENSE_LADDER,
+                name: 'slow server',
+                bandwidth: () => 1.7 * MBPS,
+                switchPenaltyMs: 4_000,
+                transcodeSpeed: () => 1.25
             }
         }
     };

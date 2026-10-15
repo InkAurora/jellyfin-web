@@ -199,3 +199,80 @@ describe('createJellyfinAbrController', () => {
         expect(hls.countHandlers(Events.MEDIA_ATTACHED)).toBe(0);
     });
 });
+
+describe('createJellyfinAbrController emergency rule', () => {
+    const baseAbandonCheck = vi.fn();
+
+    /** A stand-in for the hls.js AbrController with the members the wrapper uses. */
+    class FakeAbrController {
+        _abandonRulesCheck = baseAbandonCheck;
+        fragCurrent: unknown = null;
+        hls: FakeHls;
+        constructor(hls: FakeHls) {
+            this.hls = hls;
+        }
+        get firstAutoLevel() {
+            return 0;
+        }
+        get nextAutoLevel() {
+            return 0;
+        }
+        set nextAutoLevel(_level: number) {
+            // Not needed here.
+        }
+        destroy() {
+            // Not needed here.
+        }
+    }
+
+    function createWrappedController() {
+        const hls = new FakeHls();
+        const fakeHlsClass = { DefaultConfig: { abrController: FakeAbrController }, Events } as unknown as typeof Hls;
+        const ControllerClass = createJellyfinAbrController(fakeHlsClass);
+        const controller = new ControllerClass(hls as unknown as Hls) as unknown as {
+            _abandonRulesCheck: () => void;
+            fragCurrent: unknown;
+        };
+        hls.trigger(Events.MANIFEST_PARSED, { levels: hls.levels });
+        return { controller, hls };
+    }
+
+    function startFragment(hls: FakeHls, controller: { fragCurrent: unknown }, level: number) {
+        const frag = {
+            duration: 3,
+            level,
+            sn: 1,
+            stats: { aborted: false, loaded: 0, loading: { end: 0, first: 0, start: 1 } },
+            type: 'main'
+        };
+        hls.trigger(Events.FRAG_LOADING, { frag });
+        controller.fragCurrent = frag;
+        return frag;
+    }
+
+    beforeEach(() => {
+        baseAbandonCheck.mockClear();
+    });
+
+    it('skips the hls.js rule while the first fragment after a switch waits for its first byte', () => {
+        const { controller, hls } = createWrappedController();
+        const frag = startFragment(hls, controller, 3);
+
+        controller._abandonRulesCheck();
+        expect(baseAbandonCheck).not.toHaveBeenCalled();
+
+        frag.stats.loading.first = 500;
+        controller._abandonRulesCheck();
+        expect(baseAbandonCheck).toHaveBeenCalledTimes(1);
+    });
+
+    it('runs the hls.js rule for later fragments of the same level', () => {
+        const { controller, hls } = createWrappedController();
+        startFragment(hls, controller, 3);
+        startFragment(hls, controller, 3);
+
+        controller._abandonRulesCheck();
+
+        expect(baseAbandonCheck).toHaveBeenCalledTimes(1);
+    });
+});

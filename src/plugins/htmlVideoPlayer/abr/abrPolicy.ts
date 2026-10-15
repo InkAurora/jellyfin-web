@@ -8,6 +8,8 @@ export interface AbrTuning {
     /** After this long with no failed up-switch, the back-off goes down one step. */
     backoffDecayMs: number;
     baseDwellMs: number;
+    /** The switch cost to assume before the first switch was measured. */
+    defaultSwitchCostMs: number;
     /** Safety factor for the target of a down-switch, so one switch is enough. */
     downTargetFactor: number;
     /** A down-switch this soon after an up-switch counts as a failed up-switch. */
@@ -23,6 +25,8 @@ export interface AbrTuning {
     maxVbrRatio: number;
     midBufferFactor: number;
     slowHalfLifeSeconds: number;
+    /** The dwell time is at least this many times the measured switch cost. */
+    switchCostDwellMultiple: number;
     upFactor: number;
 }
 
@@ -30,6 +34,7 @@ export const DEFAULT_ABR_TUNING: AbrTuning = {
     backoffDecayMs: 120_000,
     backoffGrowth: 2,
     baseDwellMs: 10_000,
+    defaultSwitchCostMs: 1_000,
     downTargetFactor: 1,
     failedUpWindowMs: 30_000,
     failedUpWindowSegments: 6,
@@ -41,6 +46,7 @@ export const DEFAULT_ABR_TUNING: AbrTuning = {
     maxVbrRatio: 1.5,
     midBufferFactor: 0.85,
     slowHalfLifeSeconds: 10,
+    switchCostDwellMultiple: 5,
     upFactor: 0.7
 };
 
@@ -84,6 +90,7 @@ export interface AbrDebugState {
     failedUpSwitches: number;
     lastReason: string;
     samples: number;
+    switchCostMs: number;
     throughput: number;
     ttfbMs: number;
     vbr: number;
@@ -120,8 +127,12 @@ export function getAbrBufferThresholds(
 
 /**
  * Chooses the HLS level from the download speed and the buffer. There are no
- * phases: the level goes down at once when it is not safe, and goes up one
- * level at a time after a dwell time that grows after each failed up-switch.
+ * phases: the level goes down when it is not safe, and goes up one level at a
+ * time after a dwell time that grows after each failed up-switch.
+ *
+ * Every switch has a cost: Jellyfin restarts the transcoder, so the first
+ * fragment of the new level comes late and the buffer goes down. The policy
+ * measures that cost and only switches when the buffer can pay for it.
  */
 export class AbrPolicy {
     private currentLevel = -1;
@@ -189,6 +200,14 @@ export class AbrPolicy {
             return false;
         }
 
+        // The first fragment after a switch comes late because of the restart.
+        // A new switch would only restart the transcoder again.
+        const restartWindowMs = this.estimator.switchCostMs + (segment * 1000);
+        if (context.nowMs - this.lastSwitchAt < restartWindowMs) {
+            this.lastReason = 'stall-after-switch';
+            return false;
+        }
+
         this.switchDown(this.currentLevel - 1, context.nowMs, 'stall');
         return true;
     }
@@ -216,12 +235,17 @@ export class AbrPolicy {
         const factor = this.getSafetyFactor(context);
         let target = current;
         if (!this.isLevelSafe(current, context, factor)) {
-            target = this.findHighestSafeLevel(
+            const downTarget = this.findHighestSafeLevel(
                 context,
                 Math.min(factor, this.tuning.downTargetFactor),
                 current - 1
             );
-            this.lastReason = 'down';
+            if (this.isDownSwitchWorthIt(current, downTarget, context)) {
+                target = downTarget;
+                this.lastReason = 'down';
+            } else {
+                this.lastReason = 'down-deferred';
+            }
         } else {
             const next = this.findNextUpLevel(current, context);
             if (next >= 0 && this.canSwitchUp(next, context)) {
@@ -269,6 +293,7 @@ export class AbrPolicy {
             failedUpSwitches: this.getActiveFailedUpSwitches(nowMs),
             lastReason: this.lastReason,
             samples: this.estimator.samples,
+            switchCostMs: this.estimator.switchCostMs,
             throughput: this.estimator.throughput,
             ttfbMs: this.estimator.ttfbMs,
             vbr: this.estimator.vbr
@@ -277,9 +302,40 @@ export class AbrPolicy {
 
     private canSwitchUp(level: number, context: AbrContext) {
         const { low } = this.getBufferThresholds(context);
-        return this.getBufferSeconds(context) >= low
+        const buffer = this.getBufferSeconds(context);
+        // After the restart wait and one fetch, at least one segment must be left.
+        const margin = context.segmentDurationSeconds / this.getPlaybackRate(context);
+        return buffer >= low
+            && buffer - this.getSwitchSeconds(level, context) >= margin
             && context.nowMs - this.lastSwitchAt >= this.getDwellMs(context.nowMs)
             && this.isLevelSafe(level, context, this.tuning.upFactor);
+    }
+
+    /**
+     * A down-switch restarts the transcoder too. It is worth it when the
+     * buffer can pay for the restart, when the new level still gets its first
+     * fragment sooner, or when the current level cannot keep up at all.
+     */
+    private isDownSwitchWorthIt(current: number, target: number, context: AbrContext) {
+        if (target >= current) {
+            return false;
+        }
+
+        const segment = context.segmentDurationSeconds / this.getPlaybackRate(context);
+        const switchSeconds = this.getSwitchSeconds(target, context);
+        const stayFetchSeconds = this.getFetchSeconds(current, context);
+        return this.getBufferSeconds(context) - switchSeconds >= segment
+            || switchSeconds < stayFetchSeconds
+            || stayFetchSeconds > segment;
+    }
+
+    /** Seconds until the first fragment arrives after a switch to the level. */
+    private getSwitchSeconds(level: number, context: AbrContext) {
+        return (this.estimator.switchCostMs / 1000) + this.getFetchSeconds(level, context);
+    }
+
+    private getFetchSeconds(level: number, context: AbrContext) {
+        return this.estimator.predictFetchSeconds(this.getBitrate(level), context.segmentDurationSeconds);
     }
 
     private getSafetyFactor(context: AbrContext) {
@@ -296,11 +352,7 @@ export class AbrPolicy {
 
     private isLevelSafe(level: number, context: AbrContext, factor: number) {
         const playbackRate = this.getPlaybackRate(context);
-        const fetchSeconds = this.estimator.predictFetchSeconds(
-            this.getBitrate(level),
-            context.segmentDurationSeconds
-        );
-        return fetchSeconds <= (context.segmentDurationSeconds / playbackRate) * factor;
+        return this.getFetchSeconds(level, context) <= (context.segmentDurationSeconds / playbackRate) * factor;
     }
 
     private findHighestSafeLevel(context: AbrContext, factor: number, maximumLevel: number) {
@@ -364,7 +416,9 @@ export class AbrPolicy {
 
     private getDwellMs(nowMs: number) {
         const growth = this.tuning.backoffGrowth ** this.getActiveFailedUpSwitches(nowMs);
-        return Math.min(this.tuning.baseDwellMs * growth, this.tuning.maxDwellMs);
+        const backoffDwellMs = Math.min(this.tuning.baseDwellMs * growth, this.tuning.maxDwellMs);
+        // A costly switch must pay for itself before the next one.
+        return Math.max(backoffDwellMs, this.estimator.switchCostMs * this.tuning.switchCostDwellMultiple);
     }
 
     private getBufferSeconds(context: AbrContext) {

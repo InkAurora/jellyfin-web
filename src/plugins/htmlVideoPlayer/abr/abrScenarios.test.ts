@@ -152,6 +152,14 @@ describe.each([3, 6])('ABR scenarios with %i s segments', segmentDurationSeconds
         expect(next.minBufferCapSeconds).toBeGreaterThan(6);
     });
 
+    it('16: a slow server with a costly switch does not bounce between levels', () => {
+        const { legacy, next } = results['16 slow server, costly switch'];
+        // After the start, at most one switch: the first measurement corrects the start level.
+        expect(next.switches).toBeLessThanOrEqual(1);
+        expect(next.switches).toBeLessThan(legacy.switches);
+        expect(next.stallCount).toBeLessThan(legacy.stallCount);
+    });
+
     describe.each(Object.entries(createRobustGroups(segmentDurationSeconds)))('%s (many runs)', (_name, scenarios) => {
         const legacy = sumMetrics(scenarios, 'legacy');
         const next = sumMetrics(scenarios, 'next');

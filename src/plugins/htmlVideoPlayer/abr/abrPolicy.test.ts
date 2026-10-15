@@ -554,9 +554,18 @@ describe('AbrPolicy stalls', () => {
         const policy = createPlayingPolicy(3, 100_000_000);
         policy.recordFragmentLoading(4, 1_000);
 
-        policy.recordStall(createContext({ bufferSeconds: 0, nowMs: 4_000 }));
+        // After the restart window (1 s default switch cost + one 3 s segment).
+        policy.recordStall(createContext({ bufferSeconds: 0, nowMs: 6_000 }));
 
-        expect(policy.getDebugState(4_000)).toMatchObject({ currentLevel: 3, failedUpSwitches: 1 });
+        expect(policy.getDebugState(6_000)).toMatchObject({ currentLevel: 3, failedUpSwitches: 1 });
+    });
+
+    it('ignores a stall during the restart wait right after a switch', () => {
+        const policy = createPlayingPolicy(3, 100_000_000);
+        policy.recordFragmentLoading(4, 1_000);
+
+        expect(policy.recordStall(createContext({ bufferSeconds: 0, nowMs: 2_000 }))).toBe(false);
+        expect(policy.getDebugState(2_000)).toMatchObject({ currentLevel: 4, lastReason: 'stall-after-switch' });
     });
 
     it('scales the one segment limit with the playback rate', () => {
@@ -747,5 +756,64 @@ describe('AbrPolicy updateLevels', () => {
         policy.updateLevels(levels.slice(0, 2));
 
         expect(policy.chooseLevel(createContext({ maxLevel: 10 }))).toBe(1);
+    });
+});
+
+/** Records a first fragment after a switch whose TTFB includes a transcoder restart. */
+function feedSwitchCost(policy: AbrPolicy, bandwidth: number, ttfbMs: number) {
+    const sample = createFragmentSample({ bandwidth });
+    expect(policy.recordFragment({
+        ...sample,
+        isFirstAfterSwitch: true,
+        loadingEndMs: sample.loadingEndMs + ttfbMs,
+        loadingFirstMs: sample.loadingFirstMs + ttfbMs
+    })).toBe(true);
+}
+
+describe('AbrPolicy switch cost', () => {
+    it('makes the dwell time at least 5 times the measured switch cost', () => {
+        const policy = createPlayingPolicy(3, 100_000_000);
+        feedSwitchCost(policy, 100_000_000, 8_000);
+
+        expect(policy.getDebugState(0)).toMatchObject({ dwellSeconds: 40, switchCostMs: 8_000 });
+    });
+
+    it('goes up only when the buffer can pay for the restart and one fetch', () => {
+        const policy = createPlayingPolicy(3, 100_000_000);
+        feedSwitchCost(policy, 100_000_000, 8_000);
+
+        // 11 s buffer - (8 s restart + 0.18 s fetch) leaves less than one 3 s segment.
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 11, nowMs: 100_000 }))).toBe(3);
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 25, nowMs: 100_000 }))).toBe(4);
+    });
+
+    it('goes up with the same buffer when a switch is cheap', () => {
+        const policy = createPlayingPolicy(3, 100_000_000);
+
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 11, nowMs: 100_000 }))).toBe(4);
+    });
+
+    it('stays on a level that keeps up when a restart would cost more than it saves', () => {
+        // Level 4 (6 Mbps) at 7 Mbps: 2.57 s per 3 s segment. Not safe at a low
+        // buffer, but it keeps up, and an 8 s restart would empty the buffer.
+        const policy = createPlayingPolicy(4, 7_000_000);
+        feedSwitchCost(policy, 7_000_000, 8_000);
+
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 4, nowMs: 100_000 }))).toBe(4);
+        expect(policy.getDebugState(100_000).lastReason).toBe('down-deferred');
+    });
+
+    it('goes down anyway when the level cannot keep up', () => {
+        // Level 4 at 5 Mbps: 3.6 s per 3 s segment, so the buffer only goes down.
+        const policy = createPlayingPolicy(4, 5_000_000);
+        feedSwitchCost(policy, 5_000_000, 8_000);
+
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 4, nowMs: 100_000 }))).toBeLessThan(4);
+    });
+
+    it('goes down when a cheap switch gets the next fragment sooner', () => {
+        const policy = createPlayingPolicy(4, 7_000_000);
+
+        expect(policy.chooseLevel(createContext({ bufferSeconds: 4, nowMs: 100_000 }))).toBe(3);
     });
 });

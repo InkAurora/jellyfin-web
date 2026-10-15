@@ -29,6 +29,12 @@ export interface JellyfinAbrControllerApi {
 }
 
 type HlsClass = Pick<typeof Hls, 'DefaultConfig' | 'Events'>;
+
+/** Private hls.js AbrController members that the controller wraps. */
+interface AbrControllerInternals {
+    _abandonRulesCheck: (levelLoaded?: unknown) => void;
+    fragCurrent: Fragment | null;
+}
 type AbrControllerClass = typeof AbrController;
 
 function getAccessor(prototype: object, name: string) {
@@ -85,6 +91,7 @@ export function createJellyfinAbrController(HlsConstructor: HlsClass, options: J
 
         constructor(hls: Hls) {
             super(hls);
+            this.wrapAbandonRulesCheck();
             hls.on(Events.MANIFEST_LOADING, this.onJellyfinManifestLoading, this);
             hls.on(Events.MANIFEST_PARSED, this.onJellyfinLevelsChanged, this);
             hls.on(Events.LEVELS_UPDATED, this.onJellyfinLevelsChanged, this);
@@ -149,6 +156,30 @@ export function createJellyfinAbrController(HlsConstructor: HlsClass, options: J
                 bufferSeconds: context.bufferSeconds,
                 highBufferSeconds: thresholds.high,
                 lowBufferSeconds: thresholds.low
+            };
+        }
+
+        /**
+         * The hls.js emergency rule stops a slow fragment and loads a lower
+         * level. While the first fragment after a switch or seek waits for its
+         * first byte, the wait is the transcoder restart, and a lower level
+         * would only restart it again. So the rule waits until data arrives.
+         */
+        private wrapAbandonRulesCheck() {
+            const internals = this as unknown as AbrControllerInternals;
+            const baseCheck = internals._abandonRulesCheck;
+            if (typeof baseCheck !== 'function') {
+                return;
+            }
+
+            internals._abandonRulesCheck = (levelLoaded?: unknown) => {
+                const fragment = internals.fragCurrent;
+                if (fragment
+                    && this.firstAfterSwitchFragments.has(fragment)
+                    && fragment.stats.loading.first <= 0) {
+                    return;
+                }
+                baseCheck(levelLoaded);
             };
         }
 
