@@ -9,7 +9,7 @@ interface HlsAdaptiveBufferOptions {
     savedBufferLength: number;
 }
 
-interface HlsAbrGovernorSeedOptions {
+interface HlsAbrSeedOptions {
     configuredSafeBitrate?: number;
     fallbackBitrate: number;
     learnedBandwidthEstimate?: number;
@@ -63,7 +63,7 @@ export function getHlsAdaptiveBufferOptions(options: HlsAdaptiveBufferOptions) {
     };
 }
 
-export function getHlsAbrGovernorSeed(options: HlsAbrGovernorSeedOptions) {
+export function getHlsAbrSeed(options: HlsAbrSeedOptions) {
     if (isPositiveFinite(options.learnedBandwidthEstimate)) {
         return { initialBandwidthEstimate: options.learnedBandwidthEstimate };
     }

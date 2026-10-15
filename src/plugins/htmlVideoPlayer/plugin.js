@@ -45,11 +45,12 @@ import { PluginType } from '../../types/plugin.ts';
 import Events from '../../utils/events.ts';
 import { includesAny } from '../../utils/container.ts';
 import { isHls } from '../../utils/mediaSource.ts';
-import { HlsAbrGovernor } from './hlsAbrGovernor.ts';
 import AutoAspectRatio from './autoAspectRatio.ts';
+import { createJellyfinAbrController } from './abr/jellyfinAbrController.ts';
+import { getHlsLevelBitrate } from './abr/hlsLevelInfo.ts';
 import {
-    getHlsAbrGovernorSeed,
     getHlsAbrPlatformOptions,
+    getHlsAbrSeed,
     getHlsAdaptiveBufferOptions
 } from './hlsAbrOptions.ts';
 
@@ -148,42 +149,11 @@ function requireHlsPlayer() {
     });
 }
 
-function getHlsLevelBitrate(level) {
-    const bitrate = level?.bitrate || level?.attrs?.BANDWIDTH || level?.attrs?.AVERAGE_BANDWIDTH;
-    return parseInt(bitrate, 10) || 0;
-}
-
 function getCurrentHlsLevelBitrate(hls) {
     const level = [hls.currentLevel, hls.loadLevel, hls.nextAutoLevel, hls.firstLevel]
         .find(levelIndex => levelIndex != null && levelIndex > -1);
 
     return getHlsLevelBitrate(hls.levels[level]) || null;
-}
-
-function canApplyHlsAbrProbe(hls, probeLevel, activeLevel) {
-    if (!hls.autoLevelEnabled
-        || !Number.isInteger(probeLevel)
-        || probeLevel < 0
-        || probeLevel > hls.maxAutoLevel) {
-        return false;
-    }
-
-    const currentLevel = [activeLevel, hls.currentLevel, hls.firstLevel, 0]
-        .find(level => Number.isInteger(level) && level >= 0);
-    const current = hls.levels[currentLevel];
-    const target = hls.levels[probeLevel];
-    if (!target || probeLevel <= currentLevel || target.loadError > 0 || target.fragmentError > 0) {
-        return false;
-    }
-
-    if ((current?.codecSet && target.codecSet && current.codecSet !== target.codecSet)
-        || (current?.videoRange && target.videoRange && current.videoRange !== target.videoRange)
-        || (current?.frameRate > 0 && target.frameRate > 0 && current.frameRate > target.frameRate)
-        || target.supportedResult?.decodingInfoResults?.some(result => result.supported === false || result.smooth === false)) {
-        return false;
-    }
-
-    return true;
 }
 
 function getManualHlsLevelForBitrate(levels, maxBitrate) {
@@ -234,8 +204,6 @@ function getManualHlsLevelForBitrate(levels, maxBitrate) {
 const CUSTOM_HLS_BACK_BUFFER_LENGTH = 120;
 const MIN_HLS_BANDWIDTH_ESTIMATE = 500000;
 const CUSTOM_AUTO_INITIAL_BITRATE = 6000000;
-const HLS_ABR_GOVERNOR_TICK_MS = 2000;
-const HLS_ABR_SEEK_GRACE_MS = 10000;
 
 function getHlsAbrOptions(options) {
     if (!options.adaptiveBitrateStreaming) {
@@ -312,20 +280,20 @@ function getHlsBufferOptions(player, options) {
     };
 }
 
-function updateHlsAdaptiveBufferOptions(hls, maximumPlaybackBitrate) {
-    const manifestMaximumBitrate = Math.max(0, ...hls.levels.map(getHlsLevelBitrate));
-    const parsedMaximumPlaybackBitrate = Number.parseInt(maximumPlaybackBitrate, 10);
-    const maximumBitrate = Number.isFinite(parsedMaximumPlaybackBitrate) && parsedMaximumPlaybackBitrate > 0 ?
-        Math.min(manifestMaximumBitrate, parsedMaximumPlaybackBitrate) :
-        manifestMaximumBitrate;
+/**
+ * Sets the forward buffer limit for the level that plays now. The small
+ * limit for very high bitrates must not stay when a low level plays.
+ */
+function updateHlsAdaptiveBufferOptions(hls, levelIndex) {
+    const level = hls.levels?.[levelIndex] || hls.levels?.[0];
     Object.assign(hls.config, getHlsAdaptiveBufferOptions({
         isHighBitrateBrowser: browser.chrome || browser.edgeChromium || browser.firefox,
-        maximumBitrate,
+        maximumBitrate: getHlsLevelBitrate(level),
         savedBufferLength: userSettings.hlsForwardBufferLength()
     }));
 }
 
-function useHlsAbrGovernor(options) {
+function useJellyfinAbr(options) {
     return options.adaptiveBitrateStreaming;
 }
 
@@ -353,18 +321,6 @@ function getHlsBufferedAhead(hls, mediaElement) {
     }
 
     return getBufferedAhead(mediaElement);
-}
-
-function getHlsLevelTargetDuration(hls, levelIndex) {
-    const details = hls?.levels?.[levelIndex]?.details;
-    const targetDuration = details?.targetduration || details?.fragments?.[0]?.duration;
-
-    return Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : 3;
-}
-
-function getHlsForwardBufferCap(hls) {
-    const cap = hls?.config?.maxMaxBufferLength || hls?.config?.maxBufferLength || 0;
-    return Number.isFinite(cap) && cap > 0 ? cap : 0;
 }
 
 function getHlsFragmentRuntimeOffset(frag) {
@@ -580,29 +536,13 @@ export class HtmlVideoPlayer {
      */
     _hlsPlayer;
     /**
-     * @type {HlsAbrGovernor | undefined}
+     * @type {import('./abr/jellyfinAbrController').JellyfinAbrControllerApi | undefined}
      */
-    _hlsAbrGovernor;
+    _hlsAbrController;
     /**
      * @type {number | undefined}
      */
-    _hlsAbrGovernorTimer;
-    /**
-     * @type {WeakSet<object> | undefined}
-     */
-    _hlsAbrLoadTokens;
-    /**
-     * @type {Map<object, { failedLevel: number, nativeEmergencyLevel?: number, stats: any }> | undefined}
-     */
-    _hlsAbrPendingEmergencies;
-    /**
-     * @type {boolean | undefined}
-     */
-    _hlsAbrSeeking;
-    /**
-     * @type {number | undefined}
-     */
-    _hlsAbrSeekGraceUntil;
+    _hlsAbrBufferFullCount;
     /**
      * @type {number}
      */
@@ -645,61 +585,30 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    stopHlsAbrGovernor() {
-        const capLevel = this._hlsAbrGovernor?.getState().capLevel;
-        this.cancelPendingHlsAbrProbe(capLevel);
-        if (this._hlsAbrGovernor) {
-            this._hlsAbrGovernor.stop();
-            this._hlsAbrGovernor = undefined;
-
-            if (this._hlsPlayer) {
-                this._hlsPlayer.autoLevelCapping = -1;
-            }
-        }
-
-        if (this._hlsAbrGovernorTimer) {
-            clearInterval(this._hlsAbrGovernorTimer);
-            this._hlsAbrGovernorTimer = undefined;
-        }
-
-        this._hlsAbrLoadTokens = undefined;
-        this._hlsAbrPendingEmergencies?.clear();
-        this._hlsAbrPendingEmergencies = undefined;
-        this._hlsAbrActiveLoadToken = undefined;
-        this._hlsAbrActiveMainLevel = undefined;
+    resetHlsAbrState() {
+        this._hlsAbrController = undefined;
         this._hlsAbrBufferFullCount = undefined;
-        this._hlsAbrPendingProbeLevel = undefined;
-        this._hlsAbrSeeking = undefined;
-        this._hlsAbrSeekGraceUntil = undefined;
     }
 
     /**
      * @private
      */
-    cancelPendingHlsAbrProbe(maximumLevel) {
-        const pendingLevel = this._hlsAbrPendingProbeLevel;
-        const hls = this._hlsPlayer;
-        if (!Number.isInteger(pendingLevel) || !hls?.levels?.length) {
-            this._hlsAbrPendingProbeLevel = undefined;
-            return;
+    getHlsAbrControllerOptions(options) {
+        if (!useJellyfinAbr(options)) {
+            return {};
         }
 
-        const state = this._hlsAbrGovernor?.getState();
-        const safeMaximum = Number.isInteger(maximumLevel) ? maximumLevel : state?.capLevel;
-        const fallbackLevel = [this._hlsAbrActiveMainLevel, state?.lastLoadedLevel, hls.currentLevel, 0]
-            .find(level => Number.isInteger(level) && level >= 0 && level <= safeMaximum);
-        hls.nextAutoLevel = Number.isInteger(fallbackLevel) ? fallbackLevel : Math.max(safeMaximum || 0, 0);
-        this._hlsAbrPendingProbeLevel = undefined;
-    }
-
-    /**
-     * @private
-     */
-    resetHlsAbrGovernorForSeek(nowMs) {
-        const governor = this._hlsAbrGovernor;
-        const decision = governor?.resetForSeek(nowMs);
-        this.cancelPendingHlsAbrProbe(decision?.capLevel ?? governor?.getState().capLevel);
-        this.applyHlsAbrDecision(decision);
+        return {
+            abrController: createJellyfinAbrController(Hls, {
+                ...getHlsAbrSeed({
+                    configuredSafeBitrate: Number.parseInt(options.initialSafeStreamingBitrate, 10),
+                    fallbackBitrate: CUSTOM_AUTO_INITIAL_BITRATE
+                }),
+                onCreate: controller => {
+                    this._hlsAbrController = controller;
+                }
+            })
+        };
     }
 
     /**
@@ -732,250 +641,6 @@ export class HtmlVideoPlayer {
             }
             console.warn(`[PGS] hls runtime offset: ${offset.toFixed(3)}s`);
         }
-    }
-
-    /**
-     * @private
-     * @param {number} [bandwidthEstimate]
-     */
-    startHlsAbrGovernor(bandwidthEstimate) {
-        const hls = this._hlsPlayer;
-        if (!hls?.levels?.length || hls.levels.length < 2) {
-            return false;
-        }
-
-        this.stopHlsAbrGovernor();
-
-        const nowMs = performance.now();
-        const configuredSafeBitrate = Number.parseInt(
-            this._currentPlayOptions?.initialSafeStreamingBitrate,
-            10
-        );
-        const governor = new HlsAbrGovernor({
-            levels: hls.levels.map((level, index) => ({
-                index,
-                bitrate: getHlsLevelBitrate(level)
-            })),
-            nowMs,
-            ...getHlsAbrGovernorSeed({
-                configuredSafeBitrate,
-                fallbackBitrate: CUSTOM_AUTO_INITIAL_BITRATE,
-                learnedBandwidthEstimate: bandwidthEstimate
-            }),
-            configuredBufferCapSeconds: getHlsForwardBufferCap(hls)
-        });
-
-        if (!governor.hasMultipleLevels) {
-            return false;
-        }
-
-        this._hlsAbrGovernor = governor;
-        this._hlsAbrLoadTokens = new WeakSet();
-        this._hlsAbrPendingEmergencies = new Map();
-        this._hlsAbrActiveLoadToken = undefined;
-        this._hlsAbrActiveMainLevel = undefined;
-        this._hlsAbrBufferFullCount = 0;
-        this._hlsAbrPendingProbeLevel = undefined;
-        this._hlsAbrSeeking = false;
-        this._hlsAbrSeekGraceUntil = undefined;
-        hls.startLevel = -1;
-        hls.loadLevel = -1;
-        hls.autoLevelCapping = governor.initialCapLevel;
-
-        this._hlsAbrGovernorTimer = setInterval(() => {
-            this.flushPendingHlsAbrEmergencies();
-            this.updateHlsAbrGovernor();
-        }, HLS_ABR_GOVERNOR_TICK_MS);
-
-        this.updateHlsAbrGovernor();
-        return true;
-    }
-
-    /**
-     * @private
-     */
-    recordHlsAbrFragment(data) {
-        const governor = this._hlsAbrGovernor;
-        if (!governor) {
-            return;
-        }
-
-        const frag = data?.frag;
-        const stats = data?.part?.stats || data?.stats || frag?.stats;
-        const loadingStats = stats?.loading;
-        const level = Number(frag?.level ?? -1);
-        const durationSeconds = Number(
-            data?.part?.duration
-            ?? frag?.duration
-            ?? getHlsLevelTargetDuration(this._hlsPlayer, level)
-        );
-
-        governor.recordFragment({
-            aborted: Boolean(stats?.aborted),
-            durationSeconds,
-            isInitSegment: frag?.sn === 'initSegment',
-            isMain: frag?.type === 'main',
-            level,
-            loadedBytes: Number(stats?.loaded ?? stats?.total ?? data?.payload?.byteLength ?? 0),
-            loadingEndMs: Number(loadingStats?.end ?? 0),
-            loadingFirstMs: Number(loadingStats?.first ?? 0),
-            loadingStartMs: Number(loadingStats?.start ?? 0),
-            nowMs: performance.now()
-        });
-    }
-
-    /**
-     * @private
-     */
-    flushPendingHlsAbrEmergencies() {
-        for (const [loadToken, emergency] of this._hlsAbrPendingEmergencies || []) {
-            if (emergency.stats?.aborted) {
-                this.handleHlsAbrEmergency(loadToken, emergency);
-            } else if (emergency.stats?.loading?.end > 0) {
-                this._hlsAbrPendingEmergencies?.delete(loadToken);
-            }
-        }
-    }
-
-    /**
-     * @private
-     */
-    handleHlsAbrEmergency(loadToken, emergency) {
-        this._hlsAbrPendingEmergencies?.delete(loadToken);
-        if (!this._hlsAbrLoadTokens?.has(loadToken)) {
-            return;
-        }
-
-        this._hlsAbrLoadTokens.delete(loadToken);
-        const hls = this._hlsPlayer;
-        const latestEmergencyLevel = hls?.nextAutoLevel;
-        const nativeEmergencyLevel = Number.isInteger(latestEmergencyLevel)
-            && latestEmergencyLevel >= 0
-            && latestEmergencyLevel < emergency.failedLevel ?
-            Math.min(latestEmergencyLevel, emergency.nativeEmergencyLevel ?? latestEmergencyLevel) :
-            emergency.nativeEmergencyLevel;
-        this.updateHlsAbrGovernor({
-            currentLevel: emergency.failedLevel,
-            isEmergency: true,
-            nativeEmergencyLevel
-        });
-    }
-
-    /**
-     * @private
-     * @param {{ currentLevel?: number, isEmergency?: boolean, isWaiting?: boolean, nativeEmergencyLevel?: number }} [flags]
-     */
-    updateHlsAbrGovernor(flags = {}) {
-        const governor = this._hlsAbrGovernor;
-        const hls = this._hlsPlayer;
-        const elem = this.#mediaElement;
-        if (!governor || !hls?.levels?.length || !elem) {
-            return;
-        }
-
-        const selectedLevel = [
-            flags.currentLevel,
-            hls.loadLevel,
-            hls.nextAutoLevel,
-            hls.currentLevel,
-            hls.firstLevel,
-            0
-        ].find(level => Number.isInteger(level) && level >= 0);
-        const currentLevel = Math.min(selectedLevel, hls.levels.length - 1);
-        const nowMs = performance.now();
-        const decision = governor.observe({
-            bufferSeconds: getHlsBufferedAhead(hls, elem),
-            configuredBufferCapSeconds: getHlsForwardBufferCap(hls),
-            currentLevel,
-            hlsBandwidthEstimate: hls.bandwidthEstimate,
-            isEmergency: Boolean(flags.isEmergency),
-            isEnded: elem.ended,
-            isLive: Boolean(hls.levels[currentLevel]?.details?.live || hls.latestLevelDetails?.live),
-            isPaused: elem.paused,
-            isSeeking: elem.seeking
-                || this._hlsAbrSeeking
-                || (this._hlsAbrSeekGraceUntil != null && nowMs < this._hlsAbrSeekGraceUntil),
-            isWaiting: Boolean(flags.isWaiting),
-            nativeEmergencyLevel: flags.nativeEmergencyLevel,
-            nowMs,
-            playbackRate: elem.playbackRate,
-            segmentDurationSeconds: getHlsLevelTargetDuration(hls, currentLevel)
-        });
-
-        this.applyHlsAbrDecision(decision);
-    }
-
-    /**
-     * @private
-     */
-    applyHlsAbrDecision(decision) {
-        const hls = this._hlsPlayer;
-        if (!decision || !hls?.levels?.length) {
-            return;
-        }
-
-        const maximumLevel = hls.levels.length - 1;
-        const requestedProbeLevel = decision.probeLevel;
-        const governorState = this._hlsAbrGovernor?.getState();
-        const governorStillExpectsPendingProbe = governorState?.probationProbePending
-            && governorState.probationLevel === this._hlsAbrPendingProbeLevel;
-        if (Number.isInteger(this._hlsAbrPendingProbeLevel)
-            && requestedProbeLevel !== this._hlsAbrPendingProbeLevel
-            && !governorStillExpectsPendingProbe) {
-            this.cancelPendingHlsAbrProbe(decision.capLevel);
-        }
-
-        let effectiveDecision = decision;
-        let capLevel = Math.min(Math.max(effectiveDecision.capLevel, 0), maximumLevel);
-        hls.autoLevelCapping = capLevel;
-        let appliedProbeLevel;
-
-        if (effectiveDecision.forceLevel != null) {
-            const forceLevel = Math.min(Math.max(effectiveDecision.forceLevel, 0), capLevel);
-            hls.nextAutoLevel = forceLevel;
-            hls.nextLoadLevel = forceLevel;
-        }
-
-        if (effectiveDecision.probeLevel != null) {
-            const probeLevel = Math.min(Math.max(effectiveDecision.probeLevel, 0), capLevel);
-            const state = this._hlsAbrGovernor?.getState();
-            const activeLevel = Number.isInteger(this._hlsAbrActiveMainLevel) ?
-                this._hlsAbrActiveMainLevel :
-                state?.lastLoadedLevel;
-            if (Number.isInteger(activeLevel)
-                && activeLevel >= probeLevel
-                && this._hlsAbrGovernor?.confirmProbe(activeLevel, performance.now())) {
-                appliedProbeLevel = activeLevel;
-            } else if (canApplyHlsAbrProbe(hls, probeLevel, activeLevel)) {
-                hls.nextAutoLevel = probeLevel;
-                this._hlsAbrPendingProbeLevel = probeLevel;
-                appliedProbeLevel = probeLevel;
-            } else {
-                const rejectedDecision = this._hlsAbrGovernor?.rejectProbe(
-                    probeLevel,
-                    performance.now()
-                );
-                if (rejectedDecision) {
-                    effectiveDecision = rejectedDecision;
-                    capLevel = Math.min(Math.max(effectiveDecision.capLevel, 0), maximumLevel);
-                    hls.autoLevelCapping = capLevel;
-                }
-            }
-        }
-
-        console.debug(`hls abr governor: reason=${effectiveDecision.reason} phase=${effectiveDecision.phase} cap=${capLevel} force=${effectiveDecision.forceLevel ?? 'none'} probe=${requestedProbeLevel ?? 'none'} appliedProbe=${appliedProbeLevel ?? 'none'}`);
-    }
-
-    /**
-     * @private
-     */
-    setHlsAbrHardCap(level) {
-        if (!Number.isInteger(level) || level < 0) {
-            return;
-        }
-
-        const decision = this._hlsAbrGovernor?.setHardCap(level);
-        this.applyHlsAbrDecision(decision);
     }
 
     /**
@@ -1177,6 +842,7 @@ export class HtmlVideoPlayer {
                     manifestLoadingTimeOut: 20000,
                     preserveManualLevelOnError: true,
                     ...getHlsAbrOptions(options),
+                    ...this.getHlsAbrControllerOptions(options),
                     ...hlsBufferOptions,
                     videoPreference: { preferHDR: true },
                     xhrSetup(xhr) {
@@ -1211,130 +877,30 @@ export class HtmlVideoPlayer {
                         return;
                     }
 
-                    if (options.adaptiveBitrateStreaming) {
-                        updateHlsAdaptiveBufferOptions(hls, options.initialMaxStreamingBitrate);
+                    let manualLevel = -1;
+                    if (options.initialMaxStreamingBitrate) {
+                        manualLevel = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
+                        if (manualLevel !== -1) {
+                            hls.startLevel = manualLevel;
+                            hls.loadLevel = manualLevel;
+                        }
                     }
 
-                    if (options.initialMaxStreamingBitrate) {
-                        const level = getManualHlsLevelForBitrate(hls.levels, options.initialMaxStreamingBitrate);
-                        if (level !== -1) {
-                            this.stopHlsAbrGovernor();
-                            hls.startLevel = level;
-                            hls.loadLevel = level;
-                        }
-                    } else if (useHlsAbrGovernor(options)) {
-                        if (!this.startHlsAbrGovernor()) {
-                            hls.startLevel = -1;
-                            hls.loadLevel = -1;
-                        }
+                    if (options.adaptiveBitrateStreaming) {
+                        updateHlsAdaptiveBufferOptions(hls, manualLevel !== -1 ? manualLevel : hls.firstAutoLevel);
                     }
 
                     startHlsLoad();
                 });
 
-                hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
-                    const loadToken = data.part || data.frag;
-                    if (isCurrentHls() && this._hlsAbrGovernor && loadToken) {
-                        this.flushPendingHlsAbrEmergencies();
-                        this._hlsAbrLoadTokens?.add(loadToken);
-                        if (data.frag?.type === 'main' && data.frag?.sn !== 'initSegment') {
-                            const level = Number(data.frag.level);
-                            this._hlsAbrActiveLoadToken = loadToken;
-                            this._hlsAbrActiveMainLevel = level;
-                            if (level === this._hlsAbrPendingProbeLevel
-                                && this._hlsAbrGovernor.confirmProbe(level, performance.now())) {
-                                this._hlsAbrPendingProbeLevel = undefined;
-                            }
-                        }
-                    }
-                });
-                hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-                    const loadToken = data.part || data.frag;
-                    if (isCurrentHls() && loadToken) {
-                        this._hlsAbrPendingEmergencies?.delete(loadToken);
-                        if (loadToken === this._hlsAbrActiveLoadToken) {
-                            this._hlsAbrActiveLoadToken = undefined;
-                            this._hlsAbrActiveMainLevel = undefined;
-                        }
-                    }
-                });
-                hls.on(Hls.Events.FRAG_BUFFERED, (event, data) => {
-                    const loadToken = data.part || data.frag;
-                    if (isCurrentHls() && loadToken && this._hlsAbrLoadTokens?.has(loadToken)) {
-                        this._hlsAbrPendingEmergencies?.delete(loadToken);
-                        this._hlsAbrLoadTokens.delete(loadToken);
-                        this.recordHlsAbrFragment(data);
-                        this.updateHlsAbrGovernor({ currentLevel: data.frag?.level });
-                    }
-                });
                 hls.on(Hls.Events.FRAG_CHANGED, (event, data) => {
                     if (isCurrentHls()) {
                         this.updateHlsRuntimeTimeOffset(data.frag);
                     }
                 });
-                hls.on(Hls.Events.LEVEL_SWITCHED, () => {
-                    if (isCurrentHls()) {
-                        this.updateHlsAbrGovernor();
-                    }
-                });
-                hls.on(Hls.Events.LEVELS_UPDATED, () => {
-                    if (isCurrentHls() && this._hlsAbrGovernor) {
-                        const pendingProbeLevel = this._hlsAbrPendingProbeLevel;
-                        this._hlsAbrPendingProbeLevel = undefined;
-                        if (Number.isInteger(pendingProbeLevel)) {
-                            this.applyHlsAbrDecision(this._hlsAbrGovernor.rejectProbe(
-                                pendingProbeLevel,
-                                performance.now(),
-                                'levels-updated'
-                            ));
-                        }
-                        const decision = this._hlsAbrGovernor.updateLevels(hls.levels.map((level, index) => ({
-                            index,
-                            bitrate: getHlsLevelBitrate(level)
-                        })));
-                        if (this._hlsAbrGovernor.hasMultipleLevels) {
-                            this.applyHlsAbrDecision(decision);
-                        } else {
-                            this.stopHlsAbrGovernor();
-                        }
-                    }
-                });
-                hls.on(Hls.Events.FRAG_LOAD_EMERGENCY_ABORTED, (event, data) => {
-                    const loadToken = data.part || data.frag;
-                    const stats = data.stats || data.part?.stats || data.frag?.stats;
-                    const failedLevel = Number(data.frag?.level);
-                    const nativeEmergencyLevel = Number.isInteger(hls.nextAutoLevel)
-                        && Number.isInteger(failedLevel)
-                        && hls.nextAutoLevel >= 0
-                        && hls.nextAutoLevel < failedLevel ?
-                        hls.nextAutoLevel :
-                        undefined;
-                    if (isCurrentHls()
-                        && loadToken
-                        && this._hlsAbrLoadTokens?.has(loadToken)) {
-                        const emergency = { failedLevel, nativeEmergencyLevel, stats };
-                        // hls.js emits before a deferred abort occurs. Keep it pending until
-                        // its shared loader stats confirm the abort, or discard it when buffered.
-                        // hls.js deliberately does not abort the current request when its
-                        // emergency target is the floor, but the level-0 switch is still real.
-                        if (stats?.aborted || nativeEmergencyLevel === 0) {
-                            this.handleHlsAbrEmergency(loadToken, emergency);
-                        } else {
-                            this._hlsAbrPendingEmergencies?.set(loadToken, emergency);
-                        }
-                    }
-                });
-                hls.on(Hls.Events.FPS_DROP_LEVEL_CAPPING, (event, data) => {
-                    if (isCurrentHls()) {
-                        this.setHlsAbrHardCap(data.level);
-                        Promise.resolve().then(() => {
-                            if (isCurrentHls() && this._hlsAbrGovernor) {
-                                hls.autoLevelCapping = Math.min(
-                                    data.level,
-                                    this._hlsAbrGovernor.getState().capLevel
-                                );
-                            }
-                        });
+                hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+                    if (isCurrentHls() && options.adaptiveBitrateStreaming) {
+                        updateHlsAdaptiveBufferOptions(hls, data.level);
                     }
                 });
                 hls.on(Hls.Events.ERROR, (event, data) => {
@@ -1345,7 +911,7 @@ export class HtmlVideoPlayer {
                 });
                 hls.on(Hls.Events.DESTROYING, () => {
                     if (isCurrentHls()) {
-                        this.stopHlsAbrGovernor();
+                        this.resetHlsAbrState();
                     }
                     if (sourceGeneration !== this._hlsSourceGeneration) {
                         resolvePlayback();
@@ -1381,7 +947,7 @@ export class HtmlVideoPlayer {
             val += `#t=${seconds}`;
         }
 
-        this.stopHlsAbrGovernor();
+        this.resetHlsAbrState();
         this._hlsRuntimeTimeOffset = undefined;
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
@@ -1758,7 +1324,7 @@ export class HtmlVideoPlayer {
 
         this._hlsSourceGeneration++;
         this._activeSourceGeneration = undefined;
-        this.stopHlsAbrGovernor();
+        this.resetHlsAbrState();
 
         if (elem) {
             if (src) {
@@ -1784,7 +1350,7 @@ export class HtmlVideoPlayer {
 
         this._hlsSourceGeneration++;
         this._activeSourceGeneration = undefined;
-        this.stopHlsAbrGovernor();
+        this.resetHlsAbrState();
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
 
@@ -1846,7 +1412,7 @@ export class HtmlVideoPlayer {
         this.#autoAspectRatio = null;
         this._hlsSourceGeneration++;
         this._activeSourceGeneration = undefined;
-        this.stopHlsAbrGovernor();
+        this.resetHlsAbrState();
         this.destroyCustomTrack(elem);
         onEndedInternal(this, elem, this.onError);
     };
@@ -1937,12 +1503,6 @@ export class HtmlVideoPlayer {
          * @type {HTMLMediaElement}
          */
         const elem = e.target;
-        if (this._hlsAbrSeeking || this._hlsAbrSeekGraceUntil) {
-            this._hlsAbrSeeking = false;
-            this._hlsAbrSeekGraceUntil = undefined;
-            this.resetHlsAbrGovernorForSeek(performance.now());
-        }
-        this.updateHlsAbrGovernor();
 
         if (!this.#started) {
             this.#started = true;
@@ -2016,7 +1576,6 @@ export class HtmlVideoPlayer {
      * @private
      */
     onPause = () => {
-        this.updateHlsAbrGovernor();
         Events.trigger(this, 'pause');
     };
 
@@ -2024,11 +1583,6 @@ export class HtmlVideoPlayer {
      * @private
      */
     onSeeking = () => {
-        const nowMs = performance.now();
-        this._hlsAbrSeeking = true;
-        this._hlsAbrSeekGraceUntil = undefined;
-        this.resetHlsAbrGovernorForSeek(nowMs);
-
         Events.trigger(this, 'seeking');
     };
 
@@ -2036,19 +1590,10 @@ export class HtmlVideoPlayer {
      * @private
      */
     onSeeked = () => {
-        const nowMs = performance.now();
-        this._hlsAbrSeeking = false;
-        this._hlsAbrSeekGraceUntil = nowMs + HLS_ABR_SEEK_GRACE_MS;
-        this.resetHlsAbrGovernorForSeek(nowMs);
-
         Events.trigger(this, 'seeked');
     };
 
     onWaiting = () => {
-        if (this.#started) {
-            this.updateHlsAbrGovernor({ isWaiting: true });
-        }
-
         Events.trigger(this, 'waiting');
     };
 
@@ -2778,10 +2323,6 @@ export class HtmlVideoPlayer {
     }
 
     enableAutomaticBitrateDetection() {
-        if (this._hlsAbrGovernor) {
-            return true;
-        }
-
         const hls = this._hlsPlayer;
         if (!hls?.levels?.length || hls.levels.length < 2) {
             return null;
@@ -2807,22 +2348,15 @@ export class HtmlVideoPlayer {
             return false;
         }
 
+        const isAdaptive = useJellyfinAbr(this._currentPlayOptions || {});
         if (options.enableAutomaticBitrateDetection || !options.maxBitrate) {
-            if (useHlsAbrGovernor(this._currentPlayOptions || {})) {
-                updateHlsAdaptiveBufferOptions(hls);
-                if (!this.startHlsAbrGovernor(hls.bandwidthEstimate)) {
-                    hls.startLevel = -1;
-                    hls.loadLevel = -1;
-                }
-            } else {
-                this.stopHlsAbrGovernor();
-                hls.startLevel = -1;
-                hls.loadLevel = -1;
+            hls.startLevel = -1;
+            hls.loadLevel = -1;
+            if (isAdaptive) {
+                updateHlsAdaptiveBufferOptions(hls, Math.max(hls.currentLevel, 0));
             }
             return true;
         }
-
-        this.stopHlsAbrGovernor();
 
         const level = getManualHlsLevelForBitrate(hls.levels, options.maxBitrate);
         if (level === -1) {
@@ -2831,8 +2365,8 @@ export class HtmlVideoPlayer {
 
         hls.startLevel = level;
         hls.loadLevel = level;
-        if (useHlsAbrGovernor(this._currentPlayOptions || {})) {
-            updateHlsAdaptiveBufferOptions(hls, getHlsLevelBitrate(hls.levels[level]));
+        if (isAdaptive) {
+            updateHlsAdaptiveBufferOptions(hls, level);
         }
         return true;
     }
@@ -2918,10 +2452,6 @@ export class HtmlVideoPlayer {
         if (mediaElement) {
             if (val != null) {
                 const time = Math.max(0, (val / 1000) - this.getPlaybackRuntimeTimeOffset());
-                const nowMs = performance.now();
-                this._hlsAbrSeeking = false;
-                this._hlsAbrSeekGraceUntil = nowMs + HLS_ABR_SEEK_GRACE_MS;
-                this.resetHlsAbrGovernorForSeek(nowMs);
                 mediaElement.currentTime = time;
                 this.#currentTime = time;
                 Events.trigger(this, 'timeupdate', [{ isPositionChange: true }]);
@@ -3311,19 +2841,18 @@ export class HtmlVideoPlayer {
 
         if (this._hlsPlayer?.levels?.length) {
             const hls = this._hlsPlayer;
-            const governor = this._hlsAbrGovernor;
             const level = [hls.currentLevel, hls.loadLevel, hls.nextAutoLevel, hls.firstLevel, 0]
                 .find(levelIndex => Number.isInteger(levelIndex) && levelIndex >= 0);
             const bitrate = getHlsLevelBitrate(hls.levels[level]);
             const buffer = getHlsBufferedAhead(hls, mediaElement);
-            const state = governor?.getState();
-            const probationProbePending = Number(Boolean(state?.probationProbePending));
-            const autoDetails = state ?
-                ` / phase ${state.phase} / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / cap ${state.capLevel} / hcap ${hls.autoLevelCapping} / maxAuto ${hls.maxAutoLevel} / hardCap ${state.hardCapLevel} / manual ${hls.manualLevel} / loaded ${state.lastLoadedLevel} / probe ${state.probationLevel} / pending ${probationProbePending} / restore ${state.restoreCapLevel} / upTarget ${state.upTargetLevel} / votes ${state.upVotes} / refill ${state.pendingRefillFragments}/${state.lastRefillCredits} / hold ${Math.round(state.upHoldRemainingSeconds * 10) / 10}s / recovery ${Math.round(state.recoveryRemainingSeconds * 10) / 10}s / buf ${Math.round(buffer * 10) / 10}s / maxBuf ${Math.round(hls.maxBufferLength * 10) / 10}/${Math.round(hls.config.maxMaxBufferLength * 10) / 10}s / bufferFull ${this._hlsAbrBufferFullCount || 0} / low ${Math.round(state.lowBufferSeconds * 10) / 10}s / high ${Math.round(state.highBufferSeconds * 10) / 10}s / slope ${Math.round(state.bufferSlope * 100) / 100}s/s / predictedLoad ${Math.round(state.predictedCurrentLoadSeconds * 10) / 10}s / bwe ${Math.round(state.bandwidthEstimate / 100000) / 10} Mbps / service ${Math.round(state.serviceBandwidthEstimate / 100000) / 10} Mbps / ttfb ${Math.round(state.ttfbEstimateMs)}ms / samples ${state.confidence}` :
+            const abrState = this._hlsAbrController?.getDebugState();
+            const round = (value, digits = 1) => Math.round(value * (10 ** digits)) / (10 ** digits);
+            const autoDetails = abrState ?
+                ` / play ${hls.currentLevel} / load ${hls.loadLevel} / next ${hls.nextAutoLevel} / maxAuto ${hls.maxAutoLevel} / policy ${abrState.currentLevel} (${abrState.lastReason}) / dwell ${round(abrState.dwellRemainingSeconds)}/${round(abrState.dwellSeconds)}s / failedUps ${abrState.failedUpSwitches} / buf ${round(buffer)}s / low ${round(abrState.lowBufferSeconds)}s / high ${round(abrState.highBufferSeconds)}s / maxBuf ${round(hls.config.maxBufferLength)}s / bufferFull ${this._hlsAbrBufferFullCount || 0} / bwe ${round(abrState.throughput / 1000000)} Mbps / ttfb ${Math.round(abrState.ttfbMs)}ms / vbr ${round(abrState.vbr, 2)} / samples ${abrState.samples}` :
                 '';
             let autoMode = 'Manual';
-            if (governor) {
-                autoMode = 'Governor';
+            if (abrState && hls.autoLevelEnabled) {
+                autoMode = 'Jellyfin ABR';
             } else if (hls.autoLevelEnabled) {
                 autoMode = 'hls.js';
             }

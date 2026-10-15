@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-    getHlsAbrGovernorSeed,
+    getHlsAbrSeed,
     getHlsAbrPlatformOptions,
     getHlsAdaptiveBufferOptions
 } from './hlsAbrOptions';
@@ -83,16 +83,16 @@ describe('getHlsAdaptiveBufferOptions', () => {
     });
 });
 
-describe('getHlsAbrGovernorSeed', () => {
+describe('getHlsAbrSeed', () => {
     it('does not discount an already-safe detected bitrate again', () => {
-        expect(getHlsAbrGovernorSeed({
+        expect(getHlsAbrSeed({
             configuredSafeBitrate: 20_000_000,
             fallbackBitrate: 6_000_000
         })).toEqual({ initialBitrate: 20_000_000 });
     });
 
     it('prefers learned hls.js bandwidth when Auto is enabled during playback', () => {
-        expect(getHlsAbrGovernorSeed({
+        expect(getHlsAbrSeed({
             configuredSafeBitrate: 20_000_000,
             fallbackBitrate: 6_000_000,
             learnedBandwidthEstimate: 30_000_000
